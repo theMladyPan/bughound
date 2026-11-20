@@ -41,10 +41,17 @@ written against.
 
 ## Register it
 
-This plugin declares itself in the `plugin.json` beside its source, so the simplest registration is
-the settings page: copy this whole folder into `~/.local/state/pi-studio/plugins/bughound/`, open the
-board's settings, and enable it there — the row takes the manifest's defaults (the drawer panel, the
-`b` shortcut). Nothing starts until you enable it.
+This plugin declares itself in the `plugin.json` beside its source. Install it with one command:
+
+```
+pi-studio add https://github.com/theMladyPan/bughound.git
+```
+
+That clones this repository into `~/.local/state/pi-studio/plugins/bughound/`, builds it with
+`cargo build --release`, and leaves it for settings to offer. Open the board's settings, plugins —
+it is there, with the drawer panel and the `b` shortcut as its defaults — and enable it in one click.
+Nothing starts until you enable it. To update it later, run the same command again: it pulls and
+rebuilds, and keeps its registration.
 
 The hand-written way still works: the daemon reads its roster when it starts, from `plugins.json` in
 its state folder — by default `~/.local/state/pi-studio/plugins.json`, or `$PI_STUDIO_STATE/plugins.json`
