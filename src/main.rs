@@ -1570,6 +1570,9 @@ fn jsts_files(folder: &Path) -> Vec<PathBuf> {
 /// One file's relative import specifiers, from a naive read: comments and string contents are lexed
 /// just enough that `import` written inside them is never mistaken for a statement. Regex literals
 /// are not lexed, so a `/` inside one can begin a "comment" — a rare miss, never a crash.
+///
+/// Every comparison is against bytes: the scan steps one byte at a time, so a slice taken at that
+/// offset would land inside a letter of any script that is not ASCII.
 fn jsts_imports_of(text: &str) -> Vec<String> {
     let clean = strip_comments(text);
     let bytes = clean.as_bytes();
@@ -1578,7 +1581,7 @@ fn jsts_imports_of(text: &str) -> Vec<String> {
     while i < bytes.len() {
         let mut keyword: Option<&str> = None;
         for candidate in ["import", "export", "require"] {
-            if boundary_open(&clean, i) && clean[i..].starts_with(candidate) && boundary_close(&clean, i + candidate.len()) {
+            if boundary_open(&clean, i) && bytes[i..].starts_with(candidate.as_bytes()) && boundary_close(&clean, i + candidate.len()) {
                 keyword = Some(candidate);
                 break;
             }
@@ -1593,7 +1596,7 @@ fn jsts_imports_of(text: &str) -> Vec<String> {
             skip_space(&clean, &mut paren);
             // `import("...")` and `require("...")`: a specifier in parentheses, possibly on a
             // later line than the keyword.
-            if clean[paren..].starts_with('(') {
+            if bytes.get(paren) == Some(&b'(') {
                 let mut at = paren + 1;
                 skip_space(&clean, &mut at);
                 if let Some((spec, _)) = read_js_string(&clean, at) {
@@ -1657,7 +1660,7 @@ fn word_offset(text: &str, word: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i + word.len() <= bytes.len() {
-        if boundary_open(text, i) && text[i..].starts_with(word) && boundary_close(text, i + word.len()) {
+        if boundary_open(text, i) && bytes[i..].starts_with(word.as_bytes()) && boundary_close(text, i + word.len()) {
             return Some(i);
         }
         i += 1;
@@ -1678,10 +1681,10 @@ fn read_js_string(text: &str, at: usize) -> Option<(String, usize)> {
     while let Some(&ch) = bytes.get(i) {
         if ch == b'\\' {
             i += 1;
-            if let Some(&next) = bytes.get(i) {
-                value.push(next as char);
+            if let Some(next) = text[i..].chars().next() {
+                value.push(next);
+                i += next.len_utf8();
             }
-            i += 1;
             continue;
         }
         if ch == quote {
@@ -1690,8 +1693,10 @@ fn read_js_string(text: &str, at: usize) -> Option<(String, usize)> {
         if ch == b'\n' {
             return None;
         }
-        value.push(ch as char);
-        i += 1;
+        // A specifier is text, not bytes: a name with a letter outside ASCII is kept whole.
+        let one = text[i..].chars().next()?;
+        value.push(one);
+        i += one.len_utf8();
     }
     None
 }
@@ -1710,7 +1715,7 @@ fn statement_end(text: &str, from: usize) -> usize {
             skip_space(&text, &mut at);
             for candidate in ["import", "export", "require", "const", "let", "var", "function", "class"] {
                 if boundary_open(&text, at)
-                    && text[at..].starts_with(candidate)
+                    && bytes[at..].starts_with(candidate.as_bytes())
                     && boundary_close(&text, at + candidate.len())
                 {
                     return i;
@@ -1721,22 +1726,25 @@ fn statement_end(text: &str, from: usize) -> usize {
     bytes.len()
 }
 
-/// Comments removed, their newlines kept so the rest keeps its shape for the statement scanner.
+/// Comments removed, their newlines kept so the rest keeps its shape for the statement scanner. The
+/// bytes are copied as they are: reading one at a time as a character would split every letter
+/// outside ASCII into several, and scramble a specifier that carries one.
 fn strip_comments(text: &str) -> String {
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     let mut quote: Option<u8> = None;
     while i < bytes.len() {
         let ch = bytes[i];
         if let Some(open) = quote {
             if ch == b'\\' && i + 1 < bytes.len() {
-                out.push(ch as char);
-                out.push(bytes[i + 1] as char);
-                i += 2;
+                // The escape and the whole character it escapes, never half of one.
+                let escaped = text[i + 1..].chars().next().map(char::len_utf8).unwrap_or(1);
+                out.extend_from_slice(&bytes[i..i + 1 + escaped]);
+                i += 1 + escaped;
                 continue;
             }
-            out.push(ch as char);
+            out.push(ch);
             if ch == open {
                 quote = None;
             }
@@ -1745,7 +1753,7 @@ fn strip_comments(text: &str) -> String {
         }
         if ch == b'"' || ch == b'\'' || ch == b'`' {
             quote = Some(ch);
-            out.push(ch as char);
+            out.push(ch);
             i += 1;
             continue;
         }
@@ -1760,17 +1768,18 @@ fn strip_comments(text: &str) -> String {
             i += 2;
             while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 if bytes[i] == b'\n' {
-                    out.push('\n');
+                    out.push(b'\n');
                 }
                 i += 1;
             }
             i = (i + 2).min(bytes.len());
             continue;
         }
-        out.push(ch as char);
+        out.push(ch);
         i += 1;
     }
-    out
+    // Every cut above lands between characters, so these are the file's own bytes.
+    String::from_utf8(out).unwrap_or_else(|_| text.to_string())
 }
 
 /// A relative specifier resolved against its importer: the literal path, then with each known
@@ -2921,6 +2930,39 @@ mod tests {
         assert!(is_jsts_test_file(&PathBuf::from("test-utils.test.js")));
         assert!(!is_jsts_test_file(&PathBuf::from("src/calc.ts")));
         assert!(!is_jsts_test_file(&PathBuf::from("src/latest.ts")));
+    }
+
+    #[test]
+    fn a_file_with_letters_outside_ascii_is_still_read() {
+        // A project with a letter outside ASCII in a string, a template literal or an identifier used
+        // to stop the scan: it walked bytes and then took a slice at one, which lands inside a letter.
+        let text = "import { add } from './calc';\nconst title = \"Пříliš žluťoučký kůň — üblich\";\nconst glyph = `\u{1f642} ${title}`;\n// import { gone } from './gone';\nimport './side';\n";
+        assert_eq!(jsts_imports_of(text), vec!["./calc", "./side"]);
+        assert_eq!(
+            jsts_imports_of("import x from './kůň';\nexport { x } from './\u{1f642}';"),
+            vec!["./kůň", "./\u{1f642}"],
+            "a specifier keeps the letters it was written with"
+        );
+        assert_eq!(
+            strip_comments("// český\nconst a = \"…\";\n"),
+            "\nconst a = \"…\";\n",
+            "the text the scan reads is the file's own, not one character per byte"
+        );
+        assert_eq!(
+            jsts_imports_of("const a = \"a\\\"b\";\nimport './after';\n"),
+            vec!["./after"],
+            "an escaped quote still ends nothing, and the import after it is found"
+        );
+        // The file that stops it need not be the one edited: the whole folder is read.
+        let project = Scratch::new("unicode");
+        project.write("src/calc.ts", "export const add = (a: number) => a;\n");
+        project.write("src/other.ts", "const note = \"příliš žluťoučký kůň\";\nexport const x = 1;\n");
+        project.write("src/calc.test.ts", "import { add } from \"./calc\";\nimport \"node:test\";\n");
+        let files: BTreeSet<PathBuf> = [PathBuf::from("src/calc.ts")].into_iter().collect();
+        match resolve_jsts(&project.0, &files) {
+            Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("src/calc.test.ts")]),
+            _ => panic!("a letter outside ASCII elsewhere in the folder should not stop the resolution"),
+        }
     }
 
     #[test]
