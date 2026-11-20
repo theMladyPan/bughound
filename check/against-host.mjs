@@ -18,9 +18,16 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { startPlugin } from "../../../../server/plugins/host.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+// Where pi-studio's own server sources live: this file used to sit inside that repository under
+// examples/, and no longer does, so the checkout is named by PI_STUDIO_DIR or sits beside this one.
+const studioDir = [process.env.PI_STUDIO_DIR, join(here, "..", "..", "..", ".."), join(here, "..", "..", "..", "pi-studio")].find(
+	(dir) => dir && existsSync(join(dir, "server", "plugins", "host.ts")),
+);
+if (!studioDir) throw new Error("no pi-studio sources found; set PI_STUDIO_DIR");
+const { startPlugin } = await import(join(studioDir, "server", "plugins", "host.ts"));
 const binary = process.env.BUGHOUND_BIN ?? join(here, "..", "target", "release", "pi-studio-bughound");
 
 const root = mkdtempSync(join(tmpdir(), "pi-studio-bughound-host-"));
@@ -52,6 +59,58 @@ mkdirSync(join(folder, "tests"), { recursive: true });
 writeFileSync(join(folder, "pkg", "calc.py"), "def add(a, b):\n    return a + b\n");
 writeFileSync(join(folder, "tests", "test_calc.py"), "from pkg.calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n");
 
+// A TypeScript project beside it: tsconfig.json, one source, one test importing it — and two fake
+// tools. The type checker and node fail only when their marker files appear, which is how the test
+// below breaks and heals the folder.
+const folderTs = join(root, "tsproject");
+const WS_TS = "workspace-ts";
+mkdirSync(join(folderTs, "src"), { recursive: true });
+writeFileSync(join(folderTs, "tsconfig.json"), "{\"compilerOptions\": {\"strict\": true}}\n");
+writeFileSync(join(folderTs, "src", "calc.ts"), "export function add(a: number, b: number) {\n\treturn a + b;\n}\n");
+writeFileSync(join(folderTs, "src", "calc.test.ts"), "import { add } from \"./calc\";\n\ntest('adds', () => {});\n");
+const fakeNode = join(root, "fake-node");
+writeFileSync(
+	fakeNode,
+	[
+		"#!/bin/sh",
+		'echo "$@" >> "$PWD/ran-node.txt"',
+		'if [ -f "$PWD/FAIL-NODE" ]; then',
+		'  echo "TAP version 13"',
+		'  echo "# Subtest: adds"',
+		'  echo "not ok 1 - adds"',
+		'  echo "1..1"',
+		'  echo "# tests 1"',
+		'  echo "# pass 0"',
+		'  echo "# fail 1"',
+		"  exit 1",
+		"fi",
+		'echo "TAP version 13"',
+		'echo "# Subtest: adds"',
+		'echo "ok 1 - adds"',
+		'echo "1..1"',
+		'echo "# tests 1"',
+		'echo "# pass 1"',
+		'echo "# fail 0"',
+		"exit 0",
+		"",
+	].join("\n"),
+);
+chmodSync(fakeNode, 0o755);
+const fakeTsc = join(root, "fake-tsc");
+writeFileSync(
+	fakeTsc,
+	[
+		"#!/bin/sh",
+		'if [ -f "$PWD/FAIL-TSC" ]; then',
+		"  echo \"src/calc.ts(1,5): error TS2304: Cannot find name 'x'.\"",
+		"  exit 1",
+		"fi",
+		"exit 0",
+		"",
+	].join("\n"),
+);
+chmodSync(fakeTsc, 0o755);
+
 const quiet = () => {};
 
 /** A daemon's two methods, and every call the plugin makes of them. */
@@ -64,11 +123,13 @@ function daemon() {
 			return {
 				workspaces: [
 					{ id: WS, name: "a project", folder, missing: false, scratch: false },
+					{ id: WS_TS, name: "a ts project", folder: folderTs, missing: false, scratch: false },
 					{ id: "workspace-scratch", name: "scratch", folder: join(root, "scratch"), missing: false, scratch: true },
 				],
 			};
 		}
 		if (call.method === "cards.note") return { cardId: `card-${calls.length}`, card: {} };
+		if (call.method === "cards.remove") return { removed: true };
 		throw Object.assign(new Error(`${call.method} is not a method this daemon answers`), { code: -32601 });
 	};
 	return { calls, answer };
@@ -87,7 +148,7 @@ async function until(what, seen, timeoutMs = 15_000) {
 async function started() {
 	const server = daemon();
 	const host = await startPlugin(
-		{ name: "bughound", command: binary, args: ["--interval-ms", "250", "--debounce-ms", "100", "--pytest", fakePytest] },
+		{ name: "bughound", command: binary, args: ["--interval-ms", "250", "--debounce-ms", "100", "--pytest", fakePytest, "--node", fakeNode, "--tsc", fakeTsc] },
 		{ log: quiet, onRequest: server.answer },
 	);
 	return { host, ...server };
@@ -101,6 +162,51 @@ test("a daemon starts the plugin, and it asks for the workspaces and the settled
 		assert.match(host.info.version, /^\d+\.\d+\.\d+$/, "and the version it carries");
 		await until("asked for the workspaces and the subscription", () => calls.some((call) => call.method === "workspace.list") && calls.some((call) => call.method === "events.subscribe"));
 		assert.deepEqual(calls.find((call) => call.method === "events.subscribe")?.params, { types: ["thread.settled"] });
+	} finally {
+		await host.close();
+	}
+});
+
+test("a TypeScript workspace is watched, type-encoded, and its failure card goes when it heals", async (t) => {
+	const { host, calls } = await started();
+	try {
+		await until("the baseline scanned", async () => {
+			const state = await host.request("visual.request", { workspace: WS_TS, method: "state", params: {} });
+			return state.workspaces?.find((one) => one.id === WS_TS)?.lastScanAt != null;
+		});
+		writeFileSync(join(folderTs, "src", "calc.ts"), "export function add(a: number, b: number) {\n\treturn a + b + 0;\n}\n");
+		await until("the run lands", async () => {
+			const state = await host.request("visual.request", { workspace: WS_TS, method: "state", params: {} });
+			return state.workspaces?.find((one) => one.id === WS_TS)?.lastRun?.status === "passed";
+		});
+		const ran = await readFile(join(folderTs, "ran-node.txt"));
+		assert.match(ran, /src\/calc\.test\.ts/, "the run named the test that imports the changed file");
+		// A type error posts the card, with the file it names.
+		writeFileSync(join(folderTs, "FAIL-TSC"), "");
+		writeFileSync(join(folderTs, "src", "calc.ts"), "export function add(a: number, b: number) {\n\treturn a + b + 1;\n}\n");
+		await until("the type error lands", async () => {
+			const state = await host.request("visual.request", { workspace: WS_TS, method: "state", params: {} });
+			return state.workspaces?.find((one) => one.id === WS_TS)?.lastRun?.status === "failed";
+		});
+		const state = await host.request("visual.request", { workspace: WS_TS, method: "state", params: {} });
+		const failures = state.workspaces.find((one) => one.id === WS_TS).lastRun.failures;
+		assert.equal(failures[0].nodeid, "src/calc.ts");
+		assert.match(failures[0].summary, /TS2304/);
+		const note = calls.find((call) => call.method === "cards.note" && call.params.key === `bughound:${WS_TS}`);
+		assert.ok(note, "a card was noted for the type error");
+		assert.equal(note.params.title, "bughound: failed");
+		assert.match(note.params.markdown, /TS2304/);
+		// Healing takes the card off, once.
+		rmSync(join(folderTs, "FAIL-TSC"));
+		writeFileSync(join(folderTs, "src", "calc.ts"), "export function add(a: number, b: number) {\n\treturn a + b + 2;\n}\n");
+		await until("the card is removed", () => calls.some((call) => call.method === "cards.remove" && call.params.key === `bughound:${WS_TS}`));
+		writeFileSync(join(folderTs, "src", "calc.ts"), "export function add(a: number, b: number) {\n\treturn a + b + 3;\n}\n");
+		await until("a second green run", async () => {
+			const seen = await host.request("visual.request", { workspace: WS_TS, method: "state", params: {} });
+			return seen.workspaces?.find((one) => one.id === WS_TS)?.lastRun?.status === "passed";
+		});
+		const removals = calls.filter((call) => call.method === "cards.remove" && call.params.key === `bughound:${WS_TS}`);
+		assert.equal(removals.length, 1, "a green run with no card up removes nothing");
 	} finally {
 		await host.close();
 	}

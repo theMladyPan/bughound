@@ -24,9 +24,14 @@ process.env.PI_STUDIO_STATE = state;
 const here = dirname(fileURLToPath(import.meta.url));
 const binary = process.env.BUGHOUND_BIN ?? join(here, "..", "target", "release", "pi-studio-bughound");
 
-const { startPlugins, stopPlugins } = await import("../../../../server/plugins/manager.ts");
-const { createPluginService } = await import("../../../../server/plugins/service.ts");
-const { rememberWorkspace } = await import("../../../../server/workspaces.ts");
+// Where pi-studio's own server sources live: see against-host.mjs for why the candidates are tried.
+const studioDir = [process.env.PI_STUDIO_DIR, join(here, "..", "..", "..", ".."), join(here, "..", "..", "..", "pi-studio")].find(
+	(dir) => dir && existsSync(join(dir, "server", "plugins", "service.ts")),
+);
+if (!studioDir) throw new Error("no pi-studio sources found; set PI_STUDIO_DIR");
+const { startPlugins, stopPlugins } = await import(join(studioDir, "server", "plugins", "manager.ts"));
+const { createPluginService } = await import(join(studioDir, "server", "plugins", "service.ts"));
+const { rememberWorkspace } = await import(join(studioDir, "server", "workspaces.ts"));
 
 after(async () => {
 	await stopPlugins();
@@ -85,7 +90,7 @@ test("a failing run leaves the one card it was configured to leave, and no other
 				{
 					name: "bughound",
 					command: binary,
-					args: ["--interval-ms", "250", "--debounce-ms", "100", "--pytest", fakePytest, "--post-failures"],
+					args: ["--interval-ms", "250", "--debounce-ms", "100", "--pytest", fakePytest],
 					visual: { title: "bughound", place: "drawer", entry: "assets/panel.html", files: ["assets/panel.html", "assets/panel.js", "assets/panel.css"] },
 				},
 			],

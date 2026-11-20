@@ -462,6 +462,14 @@ impl<T: Transport> Bughound<T> {
         for params in pending {
             self.call("cards.note", params)?;
         }
+        let removals: Vec<Value> = {
+            let (lock, _) = &*self.shared;
+            let mut shared = lock.lock().unwrap();
+            shared.removals.drain(..).collect()
+        };
+        for params in removals {
+            self.call("cards.remove", params)?;
+        }
         Ok(())
     }
 
@@ -643,7 +651,8 @@ struct Config {
     workspaces: Vec<String>,
     pytest: Option<String>,
     pytest_args: Vec<String>,
-    post_failures: bool,
+    node: Option<String>,
+    tsc: Option<String>,
 }
 
 impl Config {
@@ -667,7 +676,8 @@ struct Given {
     workspaces: Vec<String>,
     pytest: Option<String>,
     pytest_args: Vec<String>,
-    post_failures: bool,
+    node: Option<String>,
+    tsc: Option<String>,
     settings_path: Option<String>,
 }
 
@@ -763,7 +773,12 @@ fn parse_given(args: &[String]) -> Result<Given, String> {
             "--settings" => {
                 given.settings_path = Some(value(&mut i)?);
             }
-            "--post-failures" => given.post_failures = true,
+            "--node" => {
+                given.node = Some(value(&mut i)?);
+            }
+            "--tsc" => {
+                given.tsc = Some(value(&mut i)?);
+            }
             _ => return Err(format!("unknown argument {flag}")),
         }
         i += 1;
@@ -797,7 +812,8 @@ fn resolve(given: Given, saved: Option<Settings>) -> Result<Config, String> {
     config.workspaces = given.workspaces;
     config.pytest = given.pytest;
     config.pytest_args = given.pytest_args;
-    config.post_failures = given.post_failures;
+    config.node = given.node;
+    config.tsc = given.tsc;
     if config.interval_ms < 250 {
         config.interval_ms = 250;
     }
@@ -839,6 +855,7 @@ struct WorkspaceTracker {
     folder: PathBuf,
     watched: bool,
     initialized: bool,
+    card_posted: bool,
     snapshot: HashMap<PathBuf, (u64, u64, u64)>,
     pending: BTreeSet<PathBuf>,
     last_change: Option<Instant>,
@@ -859,6 +876,7 @@ impl WorkspaceTracker {
             folder,
             watched,
             initialized: false,
+            card_posted: false,
             snapshot: HashMap::new(),
             pending: BTreeSet::new(),
             last_change: None,
@@ -874,10 +892,14 @@ impl WorkspaceTracker {
 }
 
 /// A run the coordinator or the panel asked for: specific test targets, or the whole suite.
+/// The JavaScript side rides beside the Python one, so one job may run both suites.
 struct Job {
     workspace: String,
     targets: Vec<PathBuf>,
     full: bool,
+    js_targets: Vec<PathBuf>,
+    js_full: bool,
+    js_typecheck: bool,
     reason: String,
 }
 
@@ -888,6 +910,7 @@ struct Shared {
     stopping: bool,
     jobs: VecDeque<Job>,
     notes: VecDeque<Value>,
+    removals: VecDeque<Value>,
 }
 
 impl Shared {
@@ -899,6 +922,7 @@ impl Shared {
             stopping: false,
             jobs: VecDeque::new(),
             notes: VecDeque::new(),
+            removals: VecDeque::new(),
         }
     }
 }
@@ -928,22 +952,39 @@ fn push_job(hub: &Hub, job: Job) {
         let (lock, _) = &**hub;
         let mut shared = lock.lock().unwrap();
         if let Some(waiting) = shared.jobs.iter_mut().find(|waiting| waiting.workspace == job.workspace) {
-            if job.full {
-                waiting.full = true;
-                waiting.targets.clear();
-            } else if !waiting.full {
-                for target in job.targets {
-                    if !waiting.targets.contains(&target) {
-                        waiting.targets.push(target);
-                    }
-                }
-            }
-            waiting.reason = job.reason;
+            merge_into(waiting, job);
         } else {
             shared.jobs.push_back(job);
         }
     }
     wake(hub);
+}
+
+/// One job absorbed into another: the whole side that asked for everything narrows the waiting job
+/// to that side, and targets only accumulate while their side has no full suite waiting.
+fn merge_into(waiting: &mut Job, job: Job) {
+    if job.full {
+        waiting.full = true;
+        waiting.targets.clear();
+    } else if !waiting.full {
+        for target in job.targets {
+            if !waiting.targets.contains(&target) {
+                waiting.targets.push(target);
+            }
+        }
+    }
+    if job.js_full {
+        waiting.js_full = true;
+        waiting.js_targets.clear();
+    } else if !waiting.js_full {
+        for target in job.js_targets {
+            if !waiting.js_targets.contains(&target) {
+                waiting.js_targets.push(target);
+            }
+        }
+    }
+    waiting.js_typecheck = waiting.js_typecheck || job.js_typecheck;
+    waiting.reason = job.reason;
 }
 
 // ---------- the coordinator: scan, debounce, resolve, dispatch ----------
@@ -1018,12 +1059,17 @@ fn coordinator(hub: Hub) {
             if !debounced || paused || busy {
                 continue;
             }
-            // Resolve without the lock: reading every Python file is the slow part.
+            // Resolve without the lock: reading every file is the slow part. The Python and the
+            // JavaScript sides resolve independently, so one change can run either or both.
             let resolution = resolve_targets(&folder, &pending.iter().cloned().collect());
-            let no_tests = matches!(resolution, Resolution::NoTests);
+            let js_resolution = resolve_jsts(&folder, &pending.iter().cloned().collect());
+            let no_tests = matches!(resolution, Resolution::NoTests) && matches!(js_resolution, Resolution::NoTests);
             let dispatched = {
                 let (lock, _) = &*hub;
                 let mut shared = lock.lock().unwrap();
+                // Read before the tracker borrows the shared map: a type check runs with every
+                // affected-test run, because a type error is the break the user meets first.
+                let has_tsc = choose_tsc(&folder, &shared.config).is_some();
                 let Some(tracker) = shared.workspaces.get_mut(&id) else {
                     continue;
                 };
@@ -1038,20 +1084,51 @@ fn coordinator(hub: Hub) {
                         tracker.phase = "idle".to_string();
                     }
                 }
+                let mut job = Job {
+                    workspace: id.clone(),
+                    targets: vec![],
+                    full: false,
+                    js_targets: vec![],
+                    js_full: false,
+                    js_typecheck: false,
+                    reason: String::new(),
+                };
                 match resolution {
                     Resolution::Full => {
                         tracker.message = "suite configuration changed: running everything".to_string();
-                        push_job_locked(&mut shared, id.clone(), vec![], true, "config changed".to_string());
+                        job.full = true;
+                        job.reason = "config changed".to_string();
                     }
                     Resolution::Targets(targets) => {
                         tracker.message = format!("{} test file(s) cover the change", targets.len());
-                        push_job_locked(&mut shared, id.clone(), targets, false, "files changed".to_string());
+                        job.targets = targets;
+                        job.reason = "files changed".to_string();
                     }
-                    Resolution::NoTests => {
-                        tracker.phase = "no_tests".to_string();
-                        tracker.message = format!("no tests cover {}", relative_names(&pending));
-                        eprintln!("bughound: {id}: no tests cover {}", relative_names(&pending));
+                    Resolution::NoTests => {}
+                }
+                // A type check runs with every affected-test run, because a type error is the break
+                // the user meets first; a config change turns it into a whole-suite run with the tests.
+                match js_resolution {
+                    Resolution::Full => {
+                        job.js_full = true;
+                        job.js_typecheck = has_tsc;
+                        job.reason = "config changed".to_string();
                     }
+                    Resolution::Targets(targets) => {
+                        job.js_targets = targets;
+                        job.js_typecheck = has_tsc;
+                        if job.reason.is_empty() {
+                            job.reason = "files changed".to_string();
+                        }
+                    }
+                    Resolution::NoTests => {}
+                }
+                if !no_tests {
+                    push_job_locked(&mut shared, id.clone(), job);
+                } else {
+                    tracker.phase = "no_tests".to_string();
+                    tracker.message = format!("no tests cover {}", relative_names(&pending));
+                    eprintln!("bughound: {id}: no tests cover {}", relative_names(&pending));
                 }
                 !no_tests
             };
@@ -1063,26 +1140,11 @@ fn coordinator(hub: Hub) {
 }
 
 /// A resolved job, pushed while the caller already holds the lock.
-fn push_job_locked(shared: &mut Shared, workspace: String, targets: Vec<PathBuf>, full: bool, reason: String) {
+fn push_job_locked(shared: &mut Shared, workspace: String, job: Job) {
     if let Some(waiting) = shared.jobs.iter_mut().find(|waiting| waiting.workspace == workspace) {
-        if full {
-            waiting.full = true;
-            waiting.targets.clear();
-        } else if !waiting.full {
-            for target in targets {
-                if !waiting.targets.contains(&target) {
-                    waiting.targets.push(target);
-                }
-            }
-        }
-        waiting.reason = reason;
+        merge_into(waiting, job);
     } else {
-        shared.jobs.push_back(Job {
-            workspace,
-            targets,
-            full,
-            reason,
-        });
+        shared.jobs.push_back(job);
     }
 }
 
@@ -1106,10 +1168,12 @@ const PRUNED: &[&str] = &[
 ];
 
 /// The relative paths worth watching: Python sources and the files pytest reads its own configuration
-/// from. A config change is a full-suite run by resolution, so it has to be noticed.
+/// from, plus JavaScript and TypeScript sources and the files their tools do. A config change is a
+/// full-suite run by resolution, so it has to be noticed.
 fn watched_file(name: &str) -> bool {
     name.ends_with(".py")
-        || matches!(name, "pyproject.toml" | "pytest.ini" | "tox.ini" | "setup.cfg")
+        || has_jsts_extension(name)
+        || matches!(name, "pyproject.toml" | "pytest.ini" | "tox.ini" | "setup.cfg" | "tsconfig.json" | "package.json")
 }
 
 /// A snapshot of one folder: every watched file's (mtime seconds, mtime nanos, length).
@@ -1431,6 +1495,503 @@ fn logical_lines(text: &str) -> Vec<String> {
     out
 }
 
+// ---------- the JavaScript and TypeScript side ----------
+
+/// Every extension this plugin understands for Node work, TypeScript first: a change to any of them
+/// is worth a run, and a specifier may land on any of them.
+const JSTS_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+
+fn has_jsts_extension(name: &str) -> bool {
+    name.rsplit('.')
+        .next()
+        .map(|ext| ext != name && JSTS_EXTS.contains(&ext))
+        .unwrap_or(false)
+}
+
+fn is_ts_extension(name: &str) -> bool {
+    matches!(name.rsplit('.').next(), Some("ts" | "tsx" | "mts" | "cts"))
+}
+
+fn has_ts_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "ts" | "tsx" | "mts" | "cts"))
+}
+
+/// A file `node --test` collects: `test.*`, `test-*.*`, `*-test.*`, or `*.test.*`.
+fn is_jsts_test_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|one| one.to_str()) else {
+        return false;
+    };
+    if !has_jsts_extension(name) {
+        return false;
+    }
+    let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    stem == "test" || stem.starts_with("test-") || stem.ends_with("-test") || stem.ends_with(".test")
+}
+
+/// Every JavaScript and TypeScript file under one folder: the walk never follows a link and never
+/// enters a pruned directory, exactly like the Python one.
+fn jsts_files(folder: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![folder.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if PRUNED.contains(&name.as_str()) || name.ends_with(".egg-info") {
+                    continue;
+                }
+                stack.push(path);
+            } else if file_type.is_file() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if has_jsts_extension(&name) {
+                    if let Ok(relative) = path.strip_prefix(folder) {
+                        out.push(relative.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// One file's relative import specifiers, from a naive read: comments and string contents are lexed
+/// just enough that `import` written inside them is never mistaken for a statement. Regex literals
+/// are not lexed, so a `/` inside one can begin a "comment" — a rare miss, never a crash.
+fn jsts_imports_of(text: &str) -> Vec<String> {
+    let clean = strip_comments(text);
+    let bytes = clean.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut keyword: Option<&str> = None;
+        for candidate in ["import", "export", "require"] {
+            if boundary_open(&clean, i) && clean[i..].starts_with(candidate) && boundary_close(&clean, i + candidate.len()) {
+                keyword = Some(candidate);
+                break;
+            }
+        }
+        let Some(keyword) = keyword else {
+            i += 1;
+            continue;
+        };
+        let after = i + keyword.len();
+        if keyword == "import" || keyword == "require" {
+            let mut paren = after;
+            skip_space(&clean, &mut paren);
+            // `import("...")` and `require("...")`: a specifier in parentheses, possibly on a
+            // later line than the keyword.
+            if clean[paren..].starts_with('(') {
+                let mut at = paren + 1;
+                skip_space(&clean, &mut at);
+                if let Some((spec, _)) = read_js_string(&clean, at) {
+                    out.push(spec);
+                }
+                i = after;
+                continue;
+            }
+        }
+        // The statement that follows, until a semicolon or the next statement. Inside it: a string
+        // right after `import` (the bare form), or the string after `from` — which also catches
+        // `import type {X} from "..."` and `export * from "...".
+        let end = statement_end(&clean, after);
+        let statement = &clean[after..end];
+        let mut at = 0;
+        skip_space_in(statement, &mut at);
+        if let Some((spec, _)) = read_js_string(statement, at) {
+            out.push(spec);
+        } else if let Some(from_at) = word_offset(statement, "from") {
+            let mut at = from_at + 4;
+            skip_space_in(statement, &mut at);
+            if let Some((spec, _)) = read_js_string(statement, at) {
+                out.push(spec);
+            }
+        }
+        i = end;
+    }
+    out
+}
+
+/// Whether a keyword at `at` begins a word here: the character before it is not part of a name.
+fn boundary_open(text: &str, at: usize) -> bool {
+    text
+        .as_bytes()
+        .get(at.wrapping_sub(1))
+        .map(|ch| !ch.is_ascii_alphanumeric() && *ch != b'_' && *ch != b'$')
+        .unwrap_or(true)
+}
+
+/// Whether a keyword ending at `at` ends a word here.
+fn boundary_close(text: &str, at: usize) -> bool {
+    text.as_bytes()
+        .get(at)
+        .map(|ch| !ch.is_ascii_alphanumeric() && *ch != b'_' && *ch != b'$')
+        .unwrap_or(true)
+}
+
+fn skip_space(text: &str, at: &mut usize) {
+    let bytes = text.as_bytes();
+    while bytes.get(*at).is_some_and(|ch| ch.is_ascii_whitespace()) {
+        *at += 1;
+    }
+}
+
+fn skip_space_in(text: &str, at: &mut usize) {
+    skip_space(text, at);
+}
+
+/// The first offence of a word before `at`, or the offset past it.
+fn word_offset(text: &str, word: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + word.len() <= bytes.len() {
+        if boundary_open(text, i) && text[i..].starts_with(word) && boundary_close(text, i + word.len()) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The string literal that opens at `at`, if one does: single or double quotes, backslash escapes
+/// taken as the plain character, and no newline inside.
+fn read_js_string(text: &str, at: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    let quote = *bytes.get(at)?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let mut value = String::new();
+    let mut i = at + 1;
+    while let Some(&ch) = bytes.get(i) {
+        if ch == b'\\' {
+            i += 1;
+            if let Some(&next) = bytes.get(i) {
+                value.push(next as char);
+            }
+            i += 1;
+            continue;
+        }
+        if ch == quote {
+            return Some((value, i + 1));
+        }
+        if ch == b'\n' {
+            return None;
+        }
+        value.push(ch as char);
+        i += 1;
+    }
+    None
+}
+
+/// Where the current `import`/`export` statement ends: at the next semicolon, or at the next line a
+/// new statement seems to start at. Semicolon-less code ends at that line, which keeps the next
+/// statement for the next pass of the outer loop.
+fn statement_end(text: &str, from: usize) -> usize {
+    let bytes = text.as_bytes();
+    for i in from..bytes.len() {
+        if bytes[i] == b';' {
+            return i;
+        }
+        if bytes[i] == b'\n' {
+            let mut at = i + 1;
+            skip_space(&text, &mut at);
+            for candidate in ["import", "export", "require", "const", "let", "var", "function", "class"] {
+                if boundary_open(&text, at)
+                    && text[at..].starts_with(candidate)
+                    && boundary_close(&text, at + candidate.len())
+                {
+                    return i;
+                }
+            }
+        }
+    }
+    bytes.len()
+}
+
+/// Comments removed, their newlines kept so the rest keeps its shape for the statement scanner.
+fn strip_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if let Some(open) = quote {
+            if ch == b'\\' && i + 1 < bytes.len() {
+                out.push(ch as char);
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            out.push(ch as char);
+            if ch == open {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == b'"' || ch == b'\'' || ch == b'`' {
+            quote = Some(ch);
+            out.push(ch as char);
+            i += 1;
+            continue;
+        }
+        if ch == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        out.push(ch as char);
+        i += 1;
+    }
+    out
+}
+
+/// A relative specifier resolved against its importer: the literal path, then with each known
+/// extension added, then as a directory with `index.<ext>`. TypeScript's ESM convention also maps a
+/// `.js` specifier back onto its `.ts` file when no plain JavaScript file is there.
+fn resolve_jsts_specifier(importer: &Path, spec: &str, known: &std::collections::HashSet<PathBuf>) -> Option<PathBuf> {
+    if spec != "." && spec != ".." && !spec.starts_with("./") && !spec.starts_with("../") {
+        return None;
+    }
+    let mut parts: Vec<&str> = importer
+        .parent()
+        .map(|parent| parent.to_str().unwrap_or("").split('/').filter(|one| !one.is_empty()).collect())
+        .unwrap_or_default();
+    for segment in spec.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    // It escapes the folder: not a file of this workspace.
+                    return None;
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    let base = parts.join("/");
+    let mut candidates: Vec<String> = vec![base.clone()];
+    for ext in JSTS_EXTS {
+        candidates.push(format!("{base}.{ext}"));
+    }
+    for ext in JSTS_EXTS {
+        candidates.push(format!("{base}/index.{ext}"));
+    }
+    // TypeScript's ESM spelling: `import "./calc.js"` meaning `calc.ts`.
+    if let Some((stem, ext)) = base.rsplit_once('.') {
+        let twin = match ext {
+            "js" => Some("ts"),
+            "jsx" => Some("tsx"),
+            "mjs" => Some("mts"),
+            "cjs" => Some("cts"),
+            _ => None,
+        };
+        if let Some(twin_ext) = twin {
+            candidates.push(format!("{stem}.{twin_ext}"));
+        }
+    }
+    for candidate in candidates {
+        let path = PathBuf::from(&candidate);
+        if known.contains(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The reverse graph of JavaScript imports under one folder: a file and every file that imports it.
+fn jsts_dependents_of(folder: &Path) -> HashMap<PathBuf, BTreeSet<PathBuf>> {
+    let files = jsts_files(folder);
+    let known: std::collections::HashSet<PathBuf> = files.iter().cloned().collect();
+    let mut dependents: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
+    for file in &files {
+        let Ok(text) = std::fs::read_to_string(folder.join(file)) else {
+            continue;
+        };
+        for spec in jsts_imports_of(&text) {
+            if let Some(target) = resolve_jsts_specifier(file, &spec, &known) {
+                if target != *file {
+                    dependents.entry(target).or_default().insert(file.clone());
+                }
+            }
+        }
+    }
+    dependents
+}
+
+/// A change in the JavaScript world to the tests that cover it: the same reading pytest gets, over a
+/// graph parsed from `import`, `export` and `require`.
+fn resolve_jsts(folder: &Path, changed: &BTreeSet<PathBuf>) -> Resolution {
+    let mut targets: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut seeds: BTreeSet<PathBuf> = BTreeSet::new();
+    for path in changed {
+        let name = path.file_name().and_then(|one| one.to_str()).unwrap_or("");
+        if matches!(name, "tsconfig.json" | "package.json") {
+            return Resolution::Full;
+        } else if has_jsts_extension(name) {
+            seeds.insert(path.clone());
+        }
+    }
+    if !seeds.is_empty() {
+        let dependents = jsts_dependents_of(folder);
+        let mut visited: HashSet<PathBuf> = HashSet::new();
+        let mut frontier: Vec<PathBuf> = seeds.into_iter().collect();
+        let mut hops = 0;
+        while !frontier.is_empty() && hops < MAX_HOPS {
+            hops += 1;
+            let mut next: Vec<PathBuf> = Vec::new();
+            for file in frontier {
+                if !visited.insert(file.clone()) {
+                    continue;
+                }
+                if is_jsts_test_file(&file) {
+                    targets.insert(file.clone());
+                }
+                if let Some(importers) = dependents.get(&file) {
+                    for importer in importers {
+                        if !visited.contains(importer) {
+                            next.push(importer.clone());
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+    }
+    if targets.is_empty() {
+        Resolution::NoTests
+    } else {
+        Resolution::Targets(targets.into_iter().collect())
+    }
+}
+
+/// The type checker that runs with a JavaScript run, when one can be found: a configured program,
+/// the project's own `node_modules/.bin/tsc`, or `tsc` on the PATH. No `tsconfig.json`, or no
+/// `tsc` anywhere, is no typecheck — never an error.
+fn choose_tsc(folder: &Path, config: &Config) -> Option<String> {
+    if !folder.join("tsconfig.json").is_file() {
+        return None;
+    }
+    if let Some(program) = &config.tsc {
+        return Some(program.clone());
+    }
+    let local = folder.join("node_modules/.bin/tsc");
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(&local)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    #[cfg(not(unix))]
+    let executable = local.is_file();
+    if executable {
+        return Some(local.to_string_lossy().into_owned());
+    }
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .any(|dir| dir.join("tsc").is_file())
+                .then_some("tsc".to_string())
+        })
+}
+
+/// The runner at the other end of every JavaScript run: a configured program, or `node` on the PATH.
+fn choose_node(config: &Config) -> String {
+    config.node.clone().unwrap_or_else(|| "node".to_string())
+}
+
+/// What `node --test` said, read back: the failing tests by name, and the counts when it gave them.
+/// The TAP shape is `not ok <n> - <name>`, nested for a failing test inside a failing file.
+fn parse_tap(output: &str, exit_code: i32) -> (String, String, Vec<Failure>) {
+    let mut failures: Vec<Failure> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut tests: Option<String> = None;
+    let mut pass: Option<String> = None;
+    let mut fail: Option<String> = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("not ok ") {
+            let name = rest
+                .split(" # ")
+                .next()
+                .map(|text| text.split_once(" - ").map(|(_, name)| name).unwrap_or(text).trim().to_string())
+                .unwrap_or_default();
+            if !name.is_empty() {
+                let key = (name.clone(), String::new());
+                if seen.insert(key) {
+                    failures.push(Failure {
+                        nodeid: name,
+                        summary: String::new(),
+                    });
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("# tests ") {
+            tests = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("# pass ") {
+            pass = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("# fail ") {
+            fail = Some(rest.trim().to_string());
+        }
+    }
+    let status = if exit_code == 0 { "passed" } else { "failed" };
+    let summary = match (tests, pass, fail) {
+        (Some(tests), Some(pass), Some(fail)) => format!("{fail} failing of {tests} tests ({pass} passed)"),
+        _ => format!("node --test exited with {exit_code}"),
+    };
+    (status.to_string(), summary, failures)
+}
+
+/// What `tsc` said, read back: `path(line,col): error TS<nnnn>: message`, one failure per file.
+fn parse_tsc_errors(output: &str) -> Vec<Failure> {
+    let mut failures: Vec<Failure> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for line in output.lines() {
+        let Some((where_, rest)) = line.split_once(": error TS") else {
+            continue;
+        };
+        let file = match where_.rsplit_once('(') {
+            Some((file, _)) => file.trim().to_string(),
+            None => where_.trim().to_string(),
+        };
+        if file.is_empty() || !seen.insert(file.clone()) {
+            continue;
+        }
+        failures.push(Failure {
+            nodeid: file,
+            summary: format!("error TS{rest}"),
+        });
+    }
+    failures
+}
+
 // ---------- the runner: one pytest at a time ----------
 
 fn runner(hub: Hub) {
@@ -1466,46 +2027,79 @@ fn runner(hub: Hub) {
                 started_at: now_ms(),
             });
         }
-        let outcome = run_pytest(&hub, job.workspace.clone(), &job);
+        // A side with no work merges away: a TypeScript-only workspace never spawns pytest, and a
+        // Python-only one never asks for tsc or node.
+        let outcome = merge_outcomes(
+            if !job.full && job.targets.is_empty() {
+                Outcome {
+                    status: "no_tests".to_string(),
+                    summary: String::new(),
+                    failures: vec![],
+                    output: String::new(),
+                    duration_ms: 0,
+                }
+            } else {
+                run_pytest(&hub, job.workspace.clone(), &job)
+            },
+            run_jsts(&hub, job.workspace.clone(), &job),
+        );
         {
             let (lock, _) = &*hub;
             let mut shared = lock.lock().unwrap();
-            let previous_failed = shared
-                .workspaces
-                .get(&job.workspace)
-                .and_then(|tracker| tracker.last_run.as_ref())
-                .map(|last| last.status == "failed")
-                .unwrap_or(false);
-            let Some(tracker) = shared.workspaces.get_mut(&job.workspace) else {
-                continue;
+            // One card holds every problem this workspace has, updated by its key on every bad run,
+            // and taken off when a run comes back green, so the board shows the problems and
+            // nothing when there are none. Decided first, queued after the tracker is unborrowed.
+            let (card_note, card_remove) = {
+                let Some(tracker) = shared.workspaces.get_mut(&job.workspace) else {
+                    continue;
+                };
+                tracker.running = None;
+                tracker.phase = "idle".to_string();
+                tracker.last_output = outcome.output.clone();
+                tracker.last_run = Some(LastRun {
+                    at: now_ms(),
+                    status: outcome.status.clone(),
+                    summary: outcome.summary.clone(),
+                    duration_ms: outcome.duration_ms,
+                    targets: target_names(&job),
+                    failures: outcome.failures.clone(),
+                });
+                let mut note = None;
+                let mut removal = None;
+                match outcome.status.as_str() {
+                    "failed" | "timeout" | "error" => {
+                        tracker.card_posted = true;
+                        note = Some(json!({
+                            "workspace": job.workspace,
+                            "title": format!("bughound: {}", outcome.status),
+                            "markdown": format!(
+                                "**{}** — {}\n\n{}\n\n{}",
+                                job.workspace,
+                                outcome.status,
+                                outcome.summary,
+                                failure_lines(&outcome.failures)
+                            ),
+                            "key": format!("bughound:{}", job.workspace),
+                        }));
+                    }
+                    "passed" => {
+                        if tracker.card_posted {
+                            tracker.card_posted = false;
+                            removal = Some(json!({
+                                "workspace": job.workspace,
+                                "key": format!("bughound:{}", job.workspace),
+                            }));
+                        }
+                    }
+                    _ => {}
+                }
+                (note, removal)
             };
-            tracker.running = None;
-            tracker.phase = "idle".to_string();
-            tracker.last_output = outcome.output.clone();
-            tracker.last_run = Some(LastRun {
-                at: now_ms(),
-                status: outcome.status.clone(),
-                summary: outcome.summary.clone(),
-                duration_ms: outcome.duration_ms,
-                targets: target_names(&job),
-                failures: outcome.failures.clone(),
-            });
-            if shared.config.post_failures
-                && (outcome.status == "failed") != previous_failed
-            {
-                let markdown = format!(
-                    "**{}** — {}\n\n{}\n\n{}",
-                    job.workspace,
-                    outcome.status,
-                    outcome.summary,
-                    failure_lines(&outcome.failures)
-                );
-                shared.notes.push_back(json!({
-                    "workspace": job.workspace,
-                    "title": format!("bughound: {}", outcome.status),
-                    "markdown": markdown,
-                    "key": format!("bughound:{}", job.workspace),
-                }));
+            if let Some(note) = card_note {
+                shared.notes.push_back(note);
+            }
+            if let Some(removal) = card_remove {
+                shared.removals.push_back(removal);
             }
         }
         // Changes that arrived during the run are now eligible for their own.
@@ -1565,10 +2159,14 @@ fn truncate_output(text: &str) -> String {
 }
 
 fn target_names(job: &Job) -> Vec<String> {
-    if job.full {
+    if job.full || job.js_full {
         vec!["<full suite>".to_string()]
     } else {
-        job.targets.iter().map(|target| target.to_string_lossy().into_owned()).collect()
+        job.targets
+            .iter()
+            .chain(job.js_targets.iter())
+            .map(|target| target.to_string_lossy().into_owned())
+            .collect()
     }
 }
 
@@ -1619,44 +2217,36 @@ struct Outcome {
     duration_ms: u64,
 }
 
-fn run_pytest(hub: &Hub, workspace: String, job: &Job) -> Outcome {
-    let (config, folder) = {
-        let (lock, _) = &**hub;
-        let shared = lock.lock().unwrap();
-        let folder = shared
-            .workspaces
-            .get(&workspace)
-            .map(|tracker| tracker.folder.clone())
-            .unwrap_or_default();
-        (shared.config.clone(), folder)
-    };
+/// One child run to the end of its pipes: streamed output, the timeout, and the exit. Every
+/// checker runs through here — pytest, the type checker, `node --test` — so the deadline, the
+/// readers and the output cap are one behavior instead of three.
+struct ProgramRun {
+    code: Option<i32>,
+    output: String,
+    timed_out: bool,
+    started: Instant,
+}
+
+fn run_program(program: &str, args: &[String], folder: &Path, env: &[(&str, &str)], timeout_s: u64, hub: &Hub) -> ProgramRun {
     let started = Instant::now();
-    let (program, mut prefix) = choose_pytest(&folder, &config);
-    let mut args = prefix.drain(..).collect::<Vec<String>>();
-    args.extend(["-q", "--tb=short", "--no-header", "--color=no"].iter().map(|one| one.to_string()));
-    if !job.full {
-        for target in &job.targets {
-            args.push(target.to_string_lossy().into_owned());
-        }
-    }
-    let mut child = match Command::new(&program)
-        .args(&args)
-        .current_dir(&folder)
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("PYTHONUNBUFFERED", "1")
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(folder)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return Outcome {
-                status: "error".to_string(),
-                summary: format!("could not start {program}: {error}"),
-                failures: vec![],
+            return ProgramRun {
+                code: None,
                 output: format!("could not start {program}: {error}\n"),
-                duration_ms: started.elapsed().as_millis() as u64,
+                timed_out: false,
+                started,
             };
         }
     };
@@ -1668,7 +2258,7 @@ fn run_pytest(hub: &Hub, workspace: String, job: &Job) -> Outcome {
     if let Some(stderr) = child.stderr.take() {
         readers.push(spawn_reader(stderr, Arc::clone(&output)));
     }
-    let deadline = started + Duration::from_secs(config.timeout_s);
+    let deadline = started + Duration::from_secs(timeout_s);
     let mut timed_out = false;
     loop {
         match child.try_wait() {
@@ -1691,29 +2281,199 @@ fn run_pytest(hub: &Hub, workspace: String, job: &Job) -> Outcome {
     for reader in readers {
         let _ = reader.join();
     }
-    let output_text = output.lock().unwrap().clone();
-    if timed_out {
+    let code = child.try_wait().ok().flatten().and_then(|status| status.code());
+    let text = output.lock().unwrap().clone();
+    ProgramRun {
+        code,
+        output: text,
+        timed_out,
+        started,
+    }
+}
+
+fn run_pytest(hub: &Hub, workspace: String, job: &Job) -> Outcome {
+    let (config, folder) = workspace_config(hub, workspace);
+    let started = Instant::now();
+    let (program, mut prefix) = choose_pytest(&folder, &config);
+    let mut args = prefix.drain(..).collect::<Vec<String>>();
+    args.extend(["-q", "--tb=short", "--no-header", "--color=no"].iter().map(|one| one.to_string()));
+    if !job.full {
+        for target in &job.targets {
+            args.push(target.to_string_lossy().into_owned());
+        }
+    }
+    let run = run_program(
+        &program,
+        &args,
+        &folder,
+        &[("PYTHONDONTWRITEBYTECODE", "1"), ("PYTHONUNBUFFERED", "1")],
+        config.timeout_s,
+        hub,
+    );
+    if run.timed_out {
         return Outcome {
             status: "timeout".to_string(),
             summary: format!("did not finish in {}s", config.timeout_s),
             failures: vec![],
-            output: output_text,
+            output: run.output,
             duration_ms: started.elapsed().as_millis() as u64,
         };
     }
-    let exit_code = child
-        .try_wait()
-        .ok()
-        .flatten()
-        .and_then(|status| status.code())
-        .unwrap_or(-1);
-    let (status, summary, failures) = parse_result(&output_text, exit_code);
+    if run.code.is_none() && run.output.starts_with("could not start") {
+        return Outcome {
+            status: "error".to_string(),
+            summary: run.output.trim().to_string(),
+            failures: vec![],
+            output: run.output,
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
+    }
+    let (status, summary, failures) = parse_result(&run.output, run.code.unwrap_or(-1));
     Outcome {
         status,
         summary,
         failures,
-        output: output_text,
+        output: run.output,
         duration_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+/// The folder and configuration a run works in, read without the lock.
+fn workspace_config(hub: &Hub, workspace: String) -> (Config, PathBuf) {
+    let (lock, _) = &**hub;
+    let shared = lock.lock().unwrap();
+    let folder = shared
+        .workspaces
+        .get(&workspace)
+        .map(|tracker| tracker.folder.clone())
+        .unwrap_or_default();
+    (shared.config.clone(), folder)
+}
+
+/// The JavaScript side of a job: the type check first, then the tests it names, with the same
+/// deadline and the same output cap as a pytest run. A job with no JavaScript work is `no_tests`
+/// and merges away into the Python outcome.
+fn run_jsts(hub: &Hub, workspace: String, job: &Job) -> Outcome {
+    let (config, folder) = workspace_config(hub, workspace);
+    let started = Instant::now();
+    let mut failures: Vec<Failure> = Vec::new();
+    let mut summaries: Vec<String> = Vec::new();
+    let mut output = String::new();
+    let mut ran = false;
+    let mut failed = false;
+    let mut status = "passed";
+    if job.js_typecheck {
+        if let Some(tsc) = choose_tsc(&folder, &config) {
+            ran = true;
+            let run = run_program(&tsc, &["--noEmit".to_string()], &folder, &[], config.timeout_s, hub);
+            if run.timed_out {
+                status = "timeout";
+                summaries.push(format!("did not finish in {}s", config.timeout_s));
+                output.push_str(&run.output);
+            } else if run.code.is_none() && run.output.starts_with("could not start") {
+                status = "error";
+                summaries.push(run.output.trim().to_string());
+                output.push_str(&run.output);
+            } else if run.code.unwrap_or(-1) != 0 {
+                status = "failed";
+                let errors = parse_tsc_errors(&run.output);
+                summaries.push(format!("{} type error(s)", errors.len()));
+                failures.extend(errors);
+                output.push_str(&run.output);
+            }
+        }
+    }
+    let tests: Vec<PathBuf> = if job.js_full {
+        jsts_files(&folder).into_iter().filter(|file| is_jsts_test_file(file)).collect()
+    } else {
+        job.js_targets.clone()
+    };
+    if !tests.is_empty() {
+        ran = true;
+        let node = choose_node(&config);
+        let args: Vec<String> = {
+            let mut args = vec!["--test".to_string()];
+            for test in &tests {
+                args.push(test.to_string_lossy().into_owned());
+            }
+            args
+        };
+        let run = run_program(&node, &args, &folder, &[], config.timeout_s, hub);
+        if run.timed_out {
+            status = "timeout";
+            summaries.push(format!("did not finish in {}s", config.timeout_s));
+        } else if run.code.is_none() && run.output.starts_with("could not start") {
+            status = "error";
+            summaries.push(run.output.trim().to_string());
+        } else {
+            let (test_status, summary, test_failures) = parse_tap(&run.output, run.code.unwrap_or(-1));
+            summaries.push(summary);
+            if test_status == "failed" && status == "passed" {
+                status = "failed";
+            }
+            failures.extend(test_failures);
+        }
+        output.push_str(&run.output);
+    }
+    if !ran {
+        return Outcome {
+            status: rep_status(status, false),
+            summary: summaries.join(" · "),
+            failures,
+            output: truncate_output(&output),
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
+    }
+    Outcome {
+        status: status.to_string(),
+        summary: summaries.join(" · "),
+        failures,
+        output: truncate_output(&output),
+        duration_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+/// Whether a status actually means nothing ran, so merging cannot call it a pass.
+fn rep_status(status: &str, ran: bool) -> String {
+    if ran {
+        status.to_string()
+    } else {
+        "no_tests".to_string()
+    }
+}
+
+/// Two outcomes, one run: a side that ran nothing merges away, and a timeout or an error on
+/// either side is what the run is.
+fn merge_outcomes(left: Outcome, right: Outcome) -> Outcome {
+    if left.status == "no_tests" {
+        return right;
+    }
+    if right.status == "no_tests" {
+        return left;
+    }
+    let rank = |status: &str| match status {
+        "timeout" => 3,
+        "error" => 2,
+        "failed" => 1,
+        _ => 0,
+    };
+    let status = if rank(&left.status) >= rank(&right.status) {
+        left.status.clone()
+    } else {
+        right.status.clone()
+    };
+    let summary = [left.summary, right.summary]
+        .into_iter()
+        .filter(|one| !one.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let output = truncate_output(&format!("{}\n{}\n", left.output, right.output));
+    Outcome {
+        status,
+        summary,
+        failures: [left.failures, right.failures].concat(),
+        output,
+        duration_ms: left.duration_ms + right.duration_ms,
     }
 }
 
@@ -1892,12 +2652,28 @@ fn queue_manual_run(hub: &Hub, scope: &str, workspace: &str) -> Value {
             if targets.is_empty() {
                 continue;
             }
+            // A failure names a Python node or a JavaScript file; each side reruns only its own.
+            let mut py_targets = Vec::new();
+            let mut js_targets = Vec::new();
+            for target in targets {
+                if target.extension().is_some_and(|ext| JSTS_EXTS.contains(&ext.to_str().unwrap_or(""))) {
+                    js_targets.push(target);
+                } else {
+                    py_targets.push(target);
+                }
+            }
+            if py_targets.is_empty() && js_targets.is_empty() {
+                continue;
+            }
             push_job(
                 hub,
                 Job {
                     workspace: id,
-                    targets,
+                    targets: py_targets,
                     full: false,
+                    js_targets,
+                    js_full: false,
+                    js_typecheck: false,
                     reason: "rerun the failures".to_string(),
                 },
             );
@@ -1909,6 +2685,9 @@ fn queue_manual_run(hub: &Hub, scope: &str, workspace: &str) -> Value {
                     workspace: id,
                     targets: vec![],
                     full: true,
+                    js_targets: vec![],
+                    js_full: true,
+                    js_typecheck: true,
                     reason: "manual run all".to_string(),
                 },
             );
@@ -1989,7 +2768,8 @@ mod tests {
         assert_eq!(config.interval_ms, 2000);
         assert_eq!(config.debounce_ms, 500);
         assert_eq!(config.timeout_s, 60);
-        assert!(!config.post_failures);
+        assert!(config.node.is_none());
+        assert!(config.tsc.is_none());
         let config = parse_args(&[
             "--interval-ms".to_string(),
             "100".to_string(),
@@ -1998,14 +2778,17 @@ mod tests {
             "uv".to_string(),
             "--pytest-arg".to_string(),
             "run".to_string(),
-            "--post-failures".to_string(),
+            "--node=deno".to_string(),
+            "--tsc".to_string(),
+            "tsc-next".to_string(),
         ])
         .unwrap();
         assert_eq!(config.interval_ms, 250, "an interval under a quarter second is clamped up");
         assert_eq!(config.workspaces, vec!["foo".to_string()]);
         assert_eq!(config.pytest.as_deref(), Some("uv"));
         assert_eq!(config.pytest_args, vec!["run".to_string()]);
-        assert!(config.post_failures);
+        assert_eq!(config.node.as_deref(), Some("deno"));
+        assert_eq!(config.tsc.as_deref(), Some("tsc-next"));
         assert!(parse_args(&["--nope".to_string()]).is_err());
         assert!(parse_args(&["--interval-ms".to_string(), "soon".to_string()]).is_err());
         assert!(parse_args(&["--interval-ms".to_string()]).is_err());
@@ -2107,6 +2890,54 @@ mod tests {
         let config = resolve(given, Some(saved)).unwrap();
         assert_eq!(config.interval_ms, 3000, "an arg wins over the file");
         assert_eq!(config.debounce_ms, 900, "what no arg said still comes from the file");
+    }
+
+    #[test]
+    fn typescript_imports_are_read_and_a_change_resolves_to_its_test() {
+        let project = Scratch::new("jstsclosure");
+        project.write(
+            "src/calc.ts",
+            "export function add(a: number, b: number) {\n    return a + b;\n}\n",
+        );
+        project.write(
+            "src/calc.test.ts",
+            "import { add } from \"./calc\";\nimport \"node:test\";\n// import { fake } from \"./fake\";\n",
+        );
+        project.write("src/other.ts", "export const x = 1;\n");
+        project.write("tsconfig.json", "{\"compilerOptions\": {}}\n");
+        // The five import shapes, a comment in the middle, and a multiline one.
+        let specs = jsts_imports_of("import { a } from './a';\nimport './side';\nexport * from \"./re\";\nconst { b } = require('./req');\nconst c = import('./dyn');\n/* import { x } from './hidden'; */\nimport {\n  d\n} from './multi';\n");
+        assert_eq!(specs, vec!["./a", "./side", "./re", "./req", "./dyn", "./multi"]);
+        let files: BTreeSet<PathBuf> = [PathBuf::from("src/calc.ts")].into_iter().collect();
+        match resolve_jsts(&project.0, &files) {
+            Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("src/calc.test.ts")]),
+            _ => panic!("a covered source file should resolve to its test"),
+        }
+        let files: BTreeSet<PathBuf> = [PathBuf::from("src/other.ts")].into_iter().collect();
+        assert!(matches!(resolve_jsts(&project.0, &files), Resolution::NoTests));
+        let files: BTreeSet<PathBuf> = [PathBuf::from("tsconfig.json")].into_iter().collect();
+        assert!(matches!(resolve_jsts(&project.0, &files), Resolution::Full));
+        assert!(is_jsts_test_file(&PathBuf::from("src/calc.test.ts")));
+        assert!(is_jsts_test_file(&PathBuf::from("test-utils.test.js")));
+        assert!(!is_jsts_test_file(&PathBuf::from("src/calc.ts")));
+        assert!(!is_jsts_test_file(&PathBuf::from("src/latest.ts")));
+    }
+
+    #[test]
+    fn tap_results_and_tsc_errors_are_read_back() {
+        let tap = "TAP version 13\n# Subtest: adds\nnot ok 1 - adds\n1..1\n# tests 1\n# pass 0\n# fail 1\n";
+        let (status, summary, failures) = parse_tap(tap, 1);
+        assert_eq!(status, "failed");
+        assert_eq!(summary, "1 failing of 1 tests (0 passed)");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].nodeid, "adds");
+        let (status, _, failures) = parse_tap("# tests 2\n# pass 2\n# fail 0\n", 0);
+        assert_eq!(status, "passed");
+        assert!(failures.is_empty());
+        let errors = parse_tsc_errors("src/calc.ts(1,5): error TS2304: Cannot find name 'x'.\nsrc/calc.ts(2,1): error TS7006: Implicit any.\nsrc/other.ts(3,2): error TS2304: Cannot find name 'y'.\n");
+        assert_eq!(errors.len(), 2, "one failure per file, not per error");
+        assert_eq!(errors[0].nodeid, "src/calc.ts");
+        assert!(errors[0].summary.starts_with("error TS2304"));
     }
 
     #[test]

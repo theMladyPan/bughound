@@ -1,12 +1,12 @@
 # bughound
 
 An optional pi-studio plugin in Rust that watches a workspace folder for file changes and, when a file
-a test covers changes, immediately runs the targeted pytest for it.
+a test covers changes, immediately runs the targeted check for it — pytest for Python, or the type
+checker plus node --test for JavaScript and TypeScript.
 
-It is an example like `examples/plugins/scratch-card` — a program you name yourself in `plugins.json`.
-No daemon registers it, ships it or looks for it on its own. The plugin system as a whole — the
-protocol, the registration, the methods and the panel a plugin can put on a board — is documented in
-`docs/plugins.md`.
+It is a plugin like any other: the daemon registers what you tell it, and ships none of it. The plugin
+system as a whole — the protocol, the registration, the methods and the panel a plugin can put on a
+board — is documented in pi-studio's `docs/plugins.md`.
 
 ## What it does
 
@@ -16,12 +16,17 @@ pipes, one JSON object per line. This plugin:
 1. answers the handshake with `{ "protocolVersion": 1, "name": "bughound", "version": … }`;
 2. calls `workspace.list` and watches every non-scratch workspace it learns there (told apart by the
    `--workspace` args when it is told any);
-3. polls those folders every `--interval-ms` (2000 by default), and when a `.py` file or a pytest
-   configuration file changes, waits `--debounce-ms` (500) for the edits to settle and then runs the
-   tests that cover the change;
-4. resolves a change to its tests by scanning Python imports — a test file runs itself, a source file
-   runs the tests that import it, a `conftest.py` change runs its folder's tests, and a configuration
-   change runs the whole suite. A file nothing covers is reported as such, and no test is spawned for it.
+3. polls those folders every `--interval-ms` (2000 by default), and when a file a test covers changes,
+   waits `--debounce-ms` (500) for the edits to settle and then runs the tests that cover the change;
+4. resolves a change to its tests by scanning imports — for Python, a test file runs itself, a source
+   file runs the tests that import it, a `conftest.py` change runs its folder's tests, and a pytest
+   configuration change runs the whole suite. For JavaScript and TypeScript, the same reading over
+   `import`, `export` and `require`, plus `tsconfig.json` and `package.json` as the whole-suite
+   trigger. A file nothing covers is reported as such, and no test is spawned for it;
+5. runs, beside the targeted tests, the folder's type checker — `tsc --noEmit` with the project's
+   `tsconfig.json` — when one is found, so a type error is worth a run too;
+6. keeps one card per workspace holding every problem the last run found, revised on every failing
+   run, and taken off the board when a run comes back green.
 
 The plugin keeps the watch and the running on threads of their own, so when the panel asks how it is
 going it is answered from shared state at once, even mid-run. The panel is a left drawer, with the
@@ -63,7 +68,7 @@ you just built and the panel it carries, in the left drawers:
   "plugins": [
     {
       "name": "bughound",
-      "command": "/absolute/path/to/examples/plugins/bughound/target/release/pi-studio-bughound",
+      "command": "/absolute/path/to/the/bughound/target/release/pi-studio-bughound",
       "args": ["--interval-ms", "2000", "--debounce-ms", "500"],
       "visual": {
         "title": "bughound",
@@ -93,8 +98,14 @@ The args, all optional:
 - `--pytest <program>` — the test program. Without it, the plugin runs a project's `.venv/bin/pytest`,
   its venv's `python -m pytest`, or `pytest` on the PATH, in that order.
 - `--pytest-arg <arg>` — repeatable; fixed flags before pytest's own.
-- `--post-failures` — off by default. When set, a run that turns failing or passing again revises one
-  card per workspace with the result.
+- `--node <program>` — the Node program the JavaScript tests run with. Without it, `node` on the PATH.
+- `--tsc <program>` — the type checker. Without it, the project's `node_modules/.bin/tsc`, then `tsc`
+  on the PATH; with no `tsconfig.json` or no `tsc` anywhere, there is no typecheck, never an error.
+
+The JavaScript side is scoped by the files themselves, not by a flag: a folder with a `tsconfig.json`
+or TypeScript files gets the type check, a folder with JavaScript or TypeScript files gets the
+targeted `node --test` runs, and a folder with both Python and JavaScript files runs both sides,
+merged into one outcome and one card. A pure JavaScript folder never spawns pytest for it.
 
 ## Check it
 
@@ -106,18 +117,20 @@ BUGHOUND_BIN=$PWD/target/release/pi-studio-bughound \
   node --test check/against-service.mjs                  # the real roster, service and board
 ```
 
-`against-host.mjs` watches a throwaway Python project through the real `PluginHost` and asserts that
-editing a source file runs the test that imports it and that a failing run is reported by node id.
+`against-host.mjs` watches a throwaway Python and TypeScript project through the real `PluginHost`
+and asserts that editing a source file runs the test that imports it, that a failing run is reported
+by node id, and that a TypeScript failure cards and then un-cards on healing.
 `against-service.mjs` registers the plugin the way the daemon does, with its panel placed in the
-drawers, and asserts that a failing run leaves the one card `--post-failures` promised. Both run
-against a fake `pytest`, so no Python environment is needed to check either.
+drawers, and asserts that a failing run leaves the one card, and a later green run takes it back.
+Both run against fake `pytest`, `node` and `tsc` scripts, so no Python environment is needed and no
+real Node project is required to check either.
 
 ## What it is not
 
 This is not a sandbox or a template for reading anything you like. A plugin runs as you, with an
 allowlisted environment, and it can do whatever your user can do; what the daemon offers it is the
-eight methods in `server/plugins/service.ts`, and this example uses two of them (`workspace.list` and
-`cards.note`, the latter only with `--post-failures`). Dynamic imports, data files and C extensions are
+nine methods in `server/plugins/service.ts`, and this example uses three of them (`workspace.list`,
+and `cards.note` with its `cards.remove` pairing). Dynamic imports, data files and C extensions are
 invisible to a static reading of imports, so a change to one of those reports that no tests cover it
 rather than guessing — the panel's run-all runs the whole suite regardless.
 
