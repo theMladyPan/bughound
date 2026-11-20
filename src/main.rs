@@ -18,8 +18,12 @@
 //! (default 2000), `--debounce-ms` (default 500), `--timeout-s` (default 60), `--workspace` (repeatable,
 //! an id, a name or a folder; the default watches every non-scratch workspace), `--pytest` (the program
 //! to run; otherwise `.venv/bin/pytest`, a venv's `python -m pytest`, or `pytest` on PATH),
-//! `--pytest-arg` (repeatable fixed flags), and `--post-failures` (off by default; when set, a run that
-//! turns failing or passing again revises one card per workspace).
+//! `--pytest-arg` (repeatable fixed flags), `--node`, `--tsc`, and `--watch` (repeatable; `python` or
+//! `javascript`, the side to switch on for the folders this plugin watches).
+//!
+//! What a folder is watched for is the panel's choice, one pair of switches per folder, both off to
+//! begin with: a folder nobody switched anything on for is never walked, spawns nothing, and posts no
+//! card. The type check rides with the JavaScript side.
 //!
 //! The methods a daemon answers are documented at the top of `server/plugins/service.ts`.
 
@@ -512,9 +516,12 @@ impl<T: Transport> Bughound<T> {
                 Ok(queue_manual_run(&self.shared, scope, workspace))
             }
             "set_config" => self.set_config(&inner),
+            "set_watch" => self.set_watch(&inner, workspace),
             other => Err(RpcError::new(
                 METHOD_NOT_FOUND,
-                &format!("{other} is not something this panel asks for; it asks for state, log, toggle_pause and run"),
+                &format!(
+                    "{other} is not something this panel asks for; it asks for state, log, toggle_pause, run, set_config and set_watch"
+                ),
             )),
         }
     }
@@ -540,11 +547,7 @@ impl<T: Transport> Bughound<T> {
         if let Some(value) = timeout {
             shared.config.timeout_s = value.max(1);
         }
-        let saved = Settings {
-            interval_ms: Some(shared.config.interval_ms),
-            debounce_ms: Some(shared.config.debounce_ms),
-            timeout_s: Some(shared.config.timeout_s),
-        };
+        let saved = Settings::from_config(&shared.config);
         if let Err(error) = saved.write(&self.settings_path) {
             eprintln!("bughound: the settings could not be written: {error}");
             return Err(RpcError::new(-32603, "the settings could not be written"));
@@ -552,6 +555,52 @@ impl<T: Transport> Bughound<T> {
         drop(shared);
         wake(&self.shared);
         Ok(json!({ "ok": true, "settings": settings_view(&self.shared) }))
+    }
+
+    /// What one folder is watched for, as the panel's own switches set it. Switching a side off stops
+    /// its scans and runs; switching one on re-reads the folder from scratch, because the files it now
+    /// cares about were never in the snapshot.
+    fn set_watch(&mut self, inner: &Value, workspace: &str) -> Result<Value, RpcError> {
+        let python = inner.get("python").and_then(Value::as_bool);
+        let javascript = inner.get("javascript").and_then(Value::as_bool);
+        if python.is_none() && javascript.is_none() {
+            return Err(RpcError::new(INVALID_PARAMS, "set_watch asks for python, javascript or both"));
+        }
+        if workspace.is_empty() {
+            return Err(RpcError::new(INVALID_PARAMS, "set_watch is asked for one workspace"));
+        }
+        let watch = {
+            let (lock, _) = &*self.shared;
+            let mut shared = lock.lock().unwrap();
+            if !shared.workspaces.contains_key(workspace) {
+                return Err(RpcError::new(INVALID_PARAMS, "this plugin does not know that workspace"));
+            }
+            let entry = shared.config.watch.entry(workspace.to_string()).or_default();
+            if let Some(value) = python {
+                entry.python = value;
+            }
+            if let Some(value) = javascript {
+                entry.javascript = value;
+            }
+            let watch = *entry;
+            let saved = Settings::from_config(&shared.config);
+            if let Err(error) = saved.write(&self.settings_path) {
+                eprintln!("bughound: the settings could not be written: {error}");
+                return Err(RpcError::new(-32603, "the settings could not be written"));
+            }
+            if let Some(tracker) = shared.workspaces.get_mut(workspace) {
+                // The next scan is a baseline again: a side just switched on has files no scan saw.
+                tracker.initialized = false;
+                tracker.snapshot.clear();
+                tracker.pending.clear();
+                tracker.last_change = None;
+                tracker.phase = if watch.any() { "idle".to_string() } else { "off".to_string() };
+                tracker.message = if watch.any() { String::new() } else { NOTHING_ON.to_string() };
+            }
+            watch
+        };
+        wake(&self.shared);
+        Ok(json!({ "ok": true, "watch": watch.view(), "settings": settings_view(&self.shared) }))
     }
 
     fn send(&mut self, message: Value) -> io::Result<()> {
@@ -629,16 +678,33 @@ fn apply_workspace_list(shared: &Arc<(Mutex<Shared>, Condvar)>, list: &Value) {
                 .iter()
                 .any(|one| one == id || one == &name || one == &folder);
         let watched = !scratch && !missing && !folder.is_empty() && allowed;
+        let defaults = shared.config.watch_defaults;
         shared.workspaces.insert(
             id.to_string(),
             WorkspaceTracker::new(id, name, PathBuf::from(folder), watched),
         );
+        // A `--watch` arg is what the registration asked for, so it seeds every folder the panel has not
+        // spoken for. Without one, a folder is watched for nothing until a switch is ticked.
+        if defaults.any() {
+            shared.config.watch.entry(id.to_string()).or_insert(defaults);
+        }
+        if !watch_of(&shared, id).any() {
+            if let Some(tracker) = shared.workspaces.get_mut(id) {
+                tracker.phase = "off".to_string();
+                tracker.message = NOTHING_ON.to_string();
+            }
+        }
     }
 }
 
 fn knows(shared: &Arc<(Mutex<Shared>, Condvar)>, workspace: &str) -> bool {
     let (lock, _) = &**shared;
     lock.lock().unwrap().workspaces.contains_key(workspace)
+}
+
+/// What one folder is watched for. A folder the panel has not spoken for is watched for nothing.
+fn watch_of(shared: &Shared, workspace: &str) -> Watch {
+    shared.config.watch.get(workspace).copied().unwrap_or_default()
 }
 
 // ---------- configuration ----------
@@ -653,6 +719,61 @@ struct Config {
     pytest_args: Vec<String>,
     node: Option<String>,
     tsc: Option<String>,
+    /// What each folder is watched for, by workspace id. A folder that is not in here is watched for
+    /// nothing at all: no scan, no run, no card. The type check rides with the JavaScript side.
+    watch: BTreeMap<String, Watch>,
+    /// The sides a `--watch` arg named: those are switched on for every folder this plugin watches,
+    /// wherever the panel has not said otherwise. Without an arg, and without the panel, nothing is.
+    watch_defaults: Watch,
+}
+
+/// What a folder's phase and its panel line say while nothing is switched on for it.
+const NOTHING_ON: &str = "nothing is switched on for this folder";
+
+/// The two things bughound can do for a folder, both off until the panel switches one on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Watch {
+    python: bool,
+    javascript: bool,
+}
+
+impl Watch {
+    fn any(&self) -> bool {
+        self.python || self.javascript
+    }
+
+    /// This watch with one more side switched on, named the way a `--watch` arg names it.
+    fn plus(self, side: &str, flag: &str) -> Result<Watch, String> {
+        match side {
+            "python" => Ok(Watch {
+                python: true,
+                ..self
+            }),
+            "javascript" | "node" => Ok(Watch {
+                javascript: true,
+                ..self
+            }),
+            other => Err(format!("{flag} names python or javascript, not {other}")),
+        }
+    }
+
+    /// The files this setting makes worth watching: the sources of a switched-on side, and the
+    /// configuration files its tools read, whose change is a whole-suite run.
+    fn wants(&self, name: &str) -> bool {
+        (self.python && (name.ends_with(".py") || matches!(name, "pyproject.toml" | "pytest.ini" | "tox.ini" | "setup.cfg")))
+            || (self.javascript && (has_jsts_extension(name) || matches!(name, "tsconfig.json" | "package.json")))
+    }
+
+    fn read(value: &Value) -> Watch {
+        Watch {
+            python: value.get("python").and_then(Value::as_bool).unwrap_or(false),
+            javascript: value.get("javascript").and_then(Value::as_bool).unwrap_or(false),
+        }
+    }
+
+    fn view(&self) -> Value {
+        json!({ "python": self.python, "javascript": self.javascript })
+    }
 }
 
 impl Config {
@@ -679,14 +800,17 @@ struct Given {
     node: Option<String>,
     tsc: Option<String>,
     settings_path: Option<String>,
+    watch_defaults: Watch,
 }
 
-/// The timings the panel's settings page last wrote, if it wrote any.
+/// The timings the panel's settings page last wrote, and what it switched the watch on for, if it
+/// wrote any.
 #[derive(Clone, Debug, Default)]
 struct Settings {
     interval_ms: Option<u64>,
     debounce_ms: Option<u64>,
     timeout_s: Option<u64>,
+    watch: BTreeMap<String, Watch>,
 }
 
 impl Settings {
@@ -701,6 +825,11 @@ impl Settings {
             interval_ms: value.get("intervalMs").and_then(Value::as_u64),
             debounce_ms: value.get("debounceMs").and_then(Value::as_u64),
             timeout_s: value.get("timeoutS").and_then(Value::as_u64),
+            watch: value
+                .get("watch")
+                .and_then(Value::as_object)
+                .map(|rows| rows.iter().map(|(id, one)| (id.clone(), Watch::read(one))).collect())
+                .unwrap_or_default(),
         }
     }
 
@@ -708,12 +837,28 @@ impl Settings {
         if let Some(folder) = path.parent() {
             std::fs::create_dir_all(folder)?;
         }
+        let watch: serde_json::Map<String, Value> = self
+            .watch
+            .iter()
+            .map(|(id, one)| (id.clone(), one.view()))
+            .collect();
         let text = json!({
             "intervalMs": self.interval_ms,
             "debounceMs": self.debounce_ms,
             "timeoutS": self.timeout_s,
+            "watch": watch,
         });
         std::fs::write(path, format!("{}\n", text))
+    }
+
+    /// The settings as they stand, so one write never loses what the other half of them said.
+    fn from_config(config: &Config) -> Settings {
+        Settings {
+            interval_ms: Some(config.interval_ms),
+            debounce_ms: Some(config.debounce_ms),
+            timeout_s: Some(config.timeout_s),
+            watch: config.watch.clone(),
+        }
     }
 }
 
@@ -779,6 +924,9 @@ fn parse_given(args: &[String]) -> Result<Given, String> {
             "--tsc" => {
                 given.tsc = Some(value(&mut i)?);
             }
+            "--watch" => {
+                given.watch_defaults = given.watch_defaults.plus(&value(&mut i)?, flag)?;
+            }
             _ => return Err(format!("unknown argument {flag}")),
         }
         i += 1;
@@ -799,6 +947,7 @@ fn resolve(given: Given, saved: Option<Settings>) -> Result<Config, String> {
         if let Some(value) = saved.timeout_s {
             config.timeout_s = value;
         }
+        config.watch = saved.watch;
     }
     if let Some(value) = given.interval_ms {
         config.interval_ms = value;
@@ -814,6 +963,7 @@ fn resolve(given: Given, saved: Option<Settings>) -> Result<Config, String> {
     config.pytest_args = given.pytest_args;
     config.node = given.node;
     config.tsc = given.tsc;
+    config.watch_defaults = given.watch_defaults;
     if config.interval_ms < 250 {
         config.interval_ms = 250;
     }
@@ -1001,19 +1151,32 @@ fn coordinator(hub: Hub) {
                 return;
             }
         }
-        // Snapshot the folders without the lock in hand: a walk is the slow part.
-        let watched: Vec<(String, PathBuf)> = {
+        // Snapshot the folders without the lock in hand: a walk is the slow part. Only a folder the
+        // panel switched something on for is walked; the rest cost one check per scan.
+        let watched: Vec<(String, PathBuf, Watch)> = {
             let (lock, _) = &*hub;
-            lock.lock()
-                .unwrap()
+            let shared = lock.lock().unwrap();
+            shared
                 .workspaces
                 .values()
                 .filter(|one| one.watched)
-                .map(|one| (one.id.clone(), one.folder.clone()))
+                .map(|one| (one.id.clone(), one.folder.clone(), watch_of(&shared, &one.id)))
                 .collect()
         };
-        for (id, folder) in watched {
-            let snapshot = scan(&folder);
+        for (id, folder, watch) in watched {
+            if !watch.any() {
+                let (lock, _) = &*hub;
+                let mut shared = lock.lock().unwrap();
+                if let Some(tracker) = shared.workspaces.get_mut(&id) {
+                    if tracker.phase != "off" {
+                        tracker.phase = "off".to_string();
+                        tracker.message = NOTHING_ON.to_string();
+                        tracker.pending.clear();
+                    }
+                }
+                continue;
+            }
+            let snapshot = scan(&folder, watch);
             let pending: Vec<PathBuf> = {
                 let (lock, _) = &*hub;
                 let mut shared = lock.lock().unwrap();
@@ -1060,9 +1223,17 @@ fn coordinator(hub: Hub) {
                 continue;
             }
             // Resolve without the lock: reading every file is the slow part. The Python and the
-            // JavaScript sides resolve independently, so one change can run either or both.
-            let resolution = resolve_targets(&folder, &pending.iter().cloned().collect());
-            let js_resolution = resolve_jsts(&folder, &pending.iter().cloned().collect());
+            // JavaScript sides resolve independently, and only the side the panel switched on is read.
+            let resolution = if watch.python {
+                resolve_targets(&folder, &pending.iter().cloned().collect())
+            } else {
+                Resolution::NoTests
+            };
+            let js_resolution = if watch.javascript {
+                resolve_jsts(&folder, &pending.iter().cloned().collect())
+            } else {
+                Resolution::NoTests
+            };
             let no_tests = matches!(resolution, Resolution::NoTests) && matches!(js_resolution, Resolution::NoTests);
             let dispatched = {
                 let (lock, _) = &*hub;
@@ -1167,18 +1338,13 @@ const PRUNED: &[&str] = &[
     ".pytest_cache", ".ruff_cache", "__pycache__", "node_modules", "target", "dist", "build", ".eggs",
 ];
 
-/// The relative paths worth watching: Python sources and the files pytest reads its own configuration
-/// from, plus JavaScript and TypeScript sources and the files their tools do. A config change is a
-/// full-suite run by resolution, so it has to be noticed.
-fn watched_file(name: &str) -> bool {
-    name.ends_with(".py")
-        || has_jsts_extension(name)
-        || matches!(name, "pyproject.toml" | "pytest.ini" | "tox.ini" | "setup.cfg" | "tsconfig.json" | "package.json")
-}
-
-/// A snapshot of one folder: every watched file's (mtime seconds, mtime nanos, length).
-fn scan(folder: &Path) -> HashMap<PathBuf, (u64, u64, u64)> {
+/// A snapshot of one folder: every file the panel switched the watch on for, as (mtime seconds, mtime
+/// nanos, length). A folder with nothing switched on is not walked at all.
+fn scan(folder: &Path, watch: Watch) -> HashMap<PathBuf, (u64, u64, u64)> {
     let mut out = HashMap::new();
+    if !watch.any() {
+        return out;
+    }
     let mut stack = vec![folder.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1200,7 +1366,7 @@ fn scan(folder: &Path) -> HashMap<PathBuf, (u64, u64, u64)> {
                 stack.push(path);
             } else if file_type.is_file() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if !watched_file(&name) {
+                if !watch.wants(&name) {
                     continue;
                 }
                 if let Ok(meta) = entry.metadata() {
@@ -2562,6 +2728,8 @@ fn state_snapshot(hub: &Hub, only: &str) -> Value {
                 "name": one.name,
                 "folder": one.folder.to_string_lossy(),
                 "watched": one.watched,
+                // What this folder is watched for, so the panel's switches show the truth the watch is run by.
+                "watch": watch_of(&shared, &one.id).view(),
                 "phase": phase,
                 "message": one.message,
                 "pending": one.pending.iter().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>(),
@@ -2641,7 +2809,18 @@ fn queue_manual_run(hub: &Hub, scope: &str, workspace: &str) -> Value {
         }
     };
     let mut queued = false;
+    // Why nothing was queued, when nothing was: a folder with nothing switched on has nothing to run.
+    let mut off: Vec<String> = Vec::new();
     for id in ids {
+        let watch = {
+            let (lock, _) = &**hub;
+            let shared = lock.lock().unwrap();
+            watch_of(&shared, &id)
+        };
+        if !watch.any() {
+            off.push(id);
+            continue;
+        }
         if scope == "failed" {
             let targets: Vec<PathBuf> = {
                 let (lock, _) = &**hub;
@@ -2661,13 +2840,16 @@ fn queue_manual_run(hub: &Hub, scope: &str, workspace: &str) -> Value {
             if targets.is_empty() {
                 continue;
             }
-            // A failure names a Python node or a JavaScript file; each side reruns only its own.
+            // A failure names a Python node or a JavaScript file; each side reruns only its own, and
+            // only while that side is switched on.
             let mut py_targets = Vec::new();
             let mut js_targets = Vec::new();
             for target in targets {
                 if target.extension().is_some_and(|ext| JSTS_EXTS.contains(&ext.to_str().unwrap_or(""))) {
-                    js_targets.push(target);
-                } else {
+                    if watch.javascript {
+                        js_targets.push(target);
+                    }
+                } else if watch.python {
                     py_targets.push(target);
                 }
             }
@@ -2688,22 +2870,29 @@ fn queue_manual_run(hub: &Hub, scope: &str, workspace: &str) -> Value {
             );
             queued = true;
         } else {
+            // A whole-suite run covers only the sides this folder is watched for: a JavaScript folder
+            // never spawns pytest, and a Python one never asks for tsc or node.
             push_job(
                 hub,
                 Job {
                     workspace: id,
                     targets: vec![],
-                    full: true,
+                    full: watch.python,
                     js_targets: vec![],
-                    js_full: true,
-                    js_typecheck: true,
+                    js_full: watch.javascript,
+                    js_typecheck: watch.javascript,
                     reason: "manual run all".to_string(),
                 },
             );
             queued = true;
         }
     }
-    json!({ "queued": queued, "scope": scope })
+    json!({
+        "queued": queued,
+        "scope": scope,
+        "off": off,
+        "reason": if queued { String::new() } else { NOTHING_ON.to_string() },
+    })
 }
 
 // ---------- the tests ----------
@@ -2801,6 +2990,11 @@ mod tests {
         assert!(parse_args(&["--nope".to_string()]).is_err());
         assert!(parse_args(&["--interval-ms".to_string(), "soon".to_string()]).is_err());
         assert!(parse_args(&["--interval-ms".to_string()]).is_err());
+        // Nothing is watched until a `--watch` arg or the panel says what for.
+        assert_eq!(parse_args(&[]).unwrap().watch_defaults, Watch::default());
+        let config = parse_args(&["--watch".to_string(), "python".to_string(), "--watch".to_string(), "javascript".to_string()]).unwrap();
+        assert_eq!(config.watch_defaults, Watch { python: true, javascript: true });
+        assert!(parse_args(&["--watch".to_string(), "ruby".to_string()]).is_err(), "an unknown side is refused rather than guessed");
     }
 
     #[test]
@@ -2877,11 +3071,37 @@ mod tests {
     }
 
     #[test]
+    fn the_switches_round_trip_through_the_settings_file() {
+        let project = Scratch::new("switches");
+        let path = project.0.join("bughound.json");
+        let mut saved = Settings {
+            interval_ms: Some(900),
+            debounce_ms: Some(300),
+            timeout_s: Some(30),
+            watch: BTreeMap::new(),
+        };
+        saved.watch.insert("one".to_string(), Watch { python: true, javascript: false });
+        saved
+            .watch
+            .insert("two".to_string(), Watch { python: false, javascript: true });
+        saved.write(&path).unwrap();
+        let read = Settings::read(&path);
+        assert_eq!(read.interval_ms, Some(900));
+        assert_eq!(read.watch.get("one").copied(), Some(Watch { python: true, javascript: false }));
+        assert_eq!(read.watch.get("two").copied(), Some(Watch { python: false, javascript: true }));
+        let config = resolve(Given::default(), Some(read)).unwrap();
+        assert_eq!(config.watch.get("two").copied(), Some(Watch { python: false, javascript: true }));
+        // A folder nobody spoke for is watched for nothing at all.
+        assert_eq!(config.watch.get("three").copied(), None);
+    }
+
+    #[test]
     fn saved_settings_yield_to_the_registration() {
         let saved = Settings {
             interval_ms: Some(900),
             debounce_ms: Some(900),
             timeout_s: Some(90),
+            ..Settings::default()
         };
         let config = resolve(Given::default(), Some(saved)).unwrap();
         assert_eq!(config.interval_ms, 900);
@@ -2895,6 +3115,7 @@ mod tests {
             interval_ms: Some(900),
             debounce_ms: Some(900),
             timeout_s: Some(90),
+            ..Settings::default()
         };
         let config = resolve(given, Some(saved)).unwrap();
         assert_eq!(config.interval_ms, 3000, "an arg wins over the file");
@@ -3009,11 +3230,15 @@ mod tests {
             response_frame(1, workspaces),
             response_frame(2, json!({ "types": ["thread.settled"] })),
             call_frame(3, "visual.request", json!({ "workspace": "ws", "method": "state", "params": {} })),
+            // Nothing is switched on yet, so the panel's run all has nothing to run and says so.
             call_frame(4, "visual.request", json!({ "workspace": "ws", "method": "run", "params": { "scope": "all" } })),
-            call_frame(5, "visual.request", json!({ "workspace": "ws", "method": "zap", "params": {} })),
+            call_frame(5, "visual.request", json!({ "workspace": "ws", "method": "set_watch", "params": { "python": true } })),
+            call_frame(6, "visual.request", json!({ "workspace": "ws", "method": "run", "params": { "scope": "all" } })),
+            call_frame(7, "visual.request", json!({ "workspace": "ws", "method": "zap", "params": {} })),
             json!({ "jsonrpc": "2.0", "method": "shutdown" }),
         ]);
-        let mut plugin = Bughound::new(script, Config::with_defaults(), project.0.join("settings.json"));
+        let settings_path = project.0.join("settings.json");
+        let mut plugin = Bughound::new(script, Config::with_defaults(), settings_path.clone());
         plugin.run().unwrap();
         let sent = &plugin.transport.sent;
         let answer = |id: i64| sent.iter().find(|frame| frame.get("id") == Some(&json!(id))).cloned();
@@ -3021,8 +3246,34 @@ mod tests {
         let state = answer(3).unwrap()["result"].clone();
         assert_eq!(state["workspaces"][0]["id"], json!("ws"));
         assert_eq!(state["workspaces"][0]["watched"], json!(true));
-        assert_eq!(answer(4).unwrap()["result"]["queued"], json!(true));
-        assert_eq!(answer(5).unwrap()["error"]["code"], json!(METHOD_NOT_FOUND));
+        assert_eq!(state["workspaces"][0]["watch"], json!({ "python": false, "javascript": false }));
+        let refused = answer(4).unwrap()["result"].clone();
+        assert_eq!(refused["queued"], json!(false), "nothing is watched until the panel says what for");
+        assert_eq!(refused["off"], json!(["ws"]));
+        assert_eq!(answer(5).unwrap()["result"]["watch"], json!({ "python": true, "javascript": false }));
+        assert_eq!(answer(6).unwrap()["result"]["queued"], json!(true));
+        assert_eq!(answer(7).unwrap()["error"]["code"], json!(METHOD_NOT_FOUND));
+        let written = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(written.contains("\"ws\""), "the switch survives the process, in the settings file: {written}");
+        assert!(written.contains("\"python\":true"), "and it is the one that was ticked: {written}");
+    }
+
+    #[test]
+    fn a_folder_is_scanned_for_the_sides_that_are_switched_on() {
+        let project = Scratch::new("sides");
+        project.write("pkg/calc.py", "X = 1\n");
+        project.write("pyproject.toml", "[project]\nname = \"x\"\n");
+        project.write("src/calc.ts", "export const x = 1;\n");
+        project.write("tsconfig.json", "{}\n");
+        let python = scan(&project.0, Watch { python: true, javascript: false });
+        let mut seen: Vec<String> = python.keys().map(|path| path.to_string_lossy().into_owned()).collect();
+        seen.sort();
+        assert_eq!(seen, vec!["pkg/calc.py", "pyproject.toml"]);
+        let js = scan(&project.0, Watch { python: false, javascript: true });
+        let mut seen: Vec<String> = js.keys().map(|path| path.to_string_lossy().into_owned()).collect();
+        seen.sort();
+        assert_eq!(seen, vec!["src/calc.ts", "tsconfig.json"]);
+        assert!(scan(&project.0, Watch::default()).is_empty(), "nothing switched on walks nothing");
     }
 }
 

@@ -4,6 +4,9 @@ An optional pi-studio plugin in Rust that watches a workspace folder for file ch
 a test covers changes, immediately runs the targeted check for it — pytest for Python, or the type
 checker plus node --test for JavaScript and TypeScript.
 
+A folder is watched for what you switch on for it in its panel: `python tests`, `javascript tests`, or
+both. Both start off, so nothing is read and nothing runs until you pick — one folder at a time.
+
 It is a plugin like any other: the daemon registers what you tell it, and ships none of it. The plugin
 system as a whole — the protocol, the registration, the methods and the panel a plugin can put on a
 board — is documented in pi-studio's `docs/plugins.md`.
@@ -16,21 +19,24 @@ pipes, one JSON object per line. This plugin:
 1. answers the handshake with `{ "protocolVersion": 1, "name": "bughound", "version": … }`;
 2. calls `workspace.list` and watches every non-scratch workspace it learns there (told apart by the
    `--workspace` args when it is told any);
-3. polls those folders every `--interval-ms` (2000 by default), and when a file a test covers changes,
-   waits `--debounce-ms` (500) for the edits to settle and then runs the tests that cover the change;
-4. resolves a change to its tests by scanning imports — for Python, a test file runs itself, a source
+3. watches a folder only for what the panel switched on for it — Python tests, JavaScript tests, or
+   both. Both start off, so a fresh install reads nothing and runs nothing until a switch is ticked;
+4. polls a folder it is watching every `--interval-ms` (2000 by default), and when a file a test covers
+   changes, waits `--debounce-ms` (500) for the edits to settle and then runs the tests that cover it;
+5. resolves a change to its tests by scanning imports — for Python, a test file runs itself, a source
    file runs the tests that import it, a `conftest.py` change runs its folder's tests, and a pytest
    configuration change runs the whole suite. For JavaScript and TypeScript, the same reading over
    `import`, `export` and `require`, plus `tsconfig.json` and `package.json` as the whole-suite
    trigger. A file nothing covers is reported as such, and no test is spawned for it;
-5. runs, beside the targeted tests, the folder's type checker — `tsc --noEmit` with the project's
-   `tsconfig.json` — when one is found, so a type error is worth a run too;
-6. keeps one card per workspace holding every problem the last run found, revised on every failing
+6. runs, beside the targeted tests, the folder's type checker — `tsc --noEmit` with the project's
+   `tsconfig.json` — when JavaScript is switched on and one is found, so a type error is worth a run too;
+7. keeps one card per workspace holding every problem the last run found, revised on every failing
    run, and taken off the board when a run comes back green.
 
 The plugin keeps the watch and the running on threads of their own, so when the panel asks how it is
 going it is answered from shared state at once, even mid-run. The panel is a left drawer, with the
-rail's own head, door and buttons: its state, its last run, the pending files and the last log.
+rail's own head, door and buttons: its state, its last run, the pending files, the last log, and the
+two switches the watch is run by.
 
 ## Build it
 
@@ -101,11 +107,21 @@ The args, all optional:
 - `--node <program>` — the Node program the JavaScript tests run with. Without it, `node` on the PATH.
 - `--tsc <program>` — the type checker. Without it, the project's `node_modules/.bin/tsc`, then `tsc`
   on the PATH; with no `tsconfig.json` or no `tsc` anywhere, there is no typecheck, never an error.
+- `--watch <python|javascript>` — repeatable; switch that side on for every folder this plugin watches.
+  It is the same switch the panel has, for a registration written by hand or a folder no panel was
+  opened on. Without it, and until a tick in the panel, a folder is watched for nothing.
 
-The JavaScript side is scoped by the files themselves, not by a flag: a folder with a `tsconfig.json`
-or TypeScript files gets the type check, a folder with JavaScript or TypeScript files gets the
-targeted `node --test` runs, and a folder with both Python and JavaScript files runs both sides,
-merged into one outcome and one card. A pure JavaScript folder never spawns pytest for it.
+The panel's settings carry the same two switches, one pair per folder: `python tests` and
+`javascript tests`. They belong to the board whose drawer they are in, are saved beside the timings in
+`bughound.json`, and take effect at once — a side switched on re-reads its folder from scratch, a side
+switched off stops its scans and its runs. Both off is the state a folder starts in, and then nothing
+is walked, no tool is spawned, and no card is posted.
+
+The type check rides with the JavaScript switch, so there is no third setting for it. The check runs
+only where a `tsconfig.json` and a `tsc` are found; a folder without them simply gets the `node --test`
+runs. A folder with both Python and JavaScript switched on runs both sides, merged into one outcome and
+one card. A JavaScript-only folder never spawns pytest, and a Python-only one never asks for node or
+tsc.
 
 ## Check it
 
