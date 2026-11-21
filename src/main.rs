@@ -539,8 +539,12 @@ impl<T: Transport> Bughound<T> {
         let interval = inner.get("intervalMs").and_then(Value::as_u64);
         let debounce = inner.get("debounceMs").and_then(Value::as_u64);
         let timeout = inner.get("timeoutS").and_then(Value::as_u64);
-        if interval.is_none() && debounce.is_none() && timeout.is_none() {
-            return Err(RpcError::new(INVALID_PARAMS, "set_config asks for intervalMs, debounceMs or timeoutS"));
+        let full_on_config_change = inner.get("fullOnConfigChange").and_then(Value::as_bool);
+        if interval.is_none() && debounce.is_none() && timeout.is_none() && full_on_config_change.is_none() {
+            return Err(RpcError::new(
+                INVALID_PARAMS,
+                "set_config asks for intervalMs, debounceMs, timeoutS or fullOnConfigChange",
+            ));
         }
         let (lock, _) = &*self.shared;
         let mut shared = lock.lock().unwrap();
@@ -552,6 +556,9 @@ impl<T: Transport> Bughound<T> {
         }
         if let Some(value) = timeout {
             shared.config.timeout_s = value.max(1);
+        }
+        if let Some(value) = full_on_config_change {
+            shared.config.full_on_config_change = value;
         }
         let saved = Settings::from_config(&shared.config);
         if let Err(error) = saved.write(&self.settings_path) {
@@ -992,6 +999,7 @@ struct Config {
     interval_ms: u64,
     debounce_ms: u64,
     timeout_s: u64,
+    full_on_config_change: bool,
     workspaces: Vec<String>,
     pytest: Option<String>,
     pytest_args: Vec<String>,
@@ -1088,6 +1096,7 @@ struct Settings {
     interval_ms: Option<u64>,
     debounce_ms: Option<u64>,
     timeout_s: Option<u64>,
+    full_on_config_change: Option<bool>,
     watch: BTreeMap<String, Watch>,
 }
 
@@ -1103,6 +1112,7 @@ impl Settings {
             interval_ms: value.get("intervalMs").and_then(Value::as_u64),
             debounce_ms: value.get("debounceMs").and_then(Value::as_u64),
             timeout_s: value.get("timeoutS").and_then(Value::as_u64),
+            full_on_config_change: value.get("fullOnConfigChange").and_then(Value::as_bool),
             watch: value
                 .get("watch")
                 .and_then(Value::as_object)
@@ -1124,6 +1134,7 @@ impl Settings {
             "intervalMs": self.interval_ms,
             "debounceMs": self.debounce_ms,
             "timeoutS": self.timeout_s,
+            "fullOnConfigChange": self.full_on_config_change.unwrap_or(false),
             "watch": watch,
         });
         std::fs::write(path, format!("{}\n", text))
@@ -1135,6 +1146,7 @@ impl Settings {
             interval_ms: Some(config.interval_ms),
             debounce_ms: Some(config.debounce_ms),
             timeout_s: Some(config.timeout_s),
+            full_on_config_change: Some(config.full_on_config_change),
             watch: config.watch.clone(),
         }
     }
@@ -1224,6 +1236,9 @@ fn resolve(given: Given, saved: Option<Settings>) -> Result<Config, String> {
         }
         if let Some(value) = saved.timeout_s {
             config.timeout_s = value;
+        }
+        if let Some(value) = saved.full_on_config_change {
+            config.full_on_config_change = value;
         }
         config.watch = saved.watch;
     }
@@ -1649,7 +1664,7 @@ fn coordinator(hub: Hub) {
                 continue;
             }
             // A pause holds the run, not the watch: the pending set stays for the resume.
-            let (debounced, paused, busy) = {
+            let (debounced, paused, busy, full_on_config_change) = {
                 let (lock, _) = &*hub;
                 let shared = lock.lock().unwrap();
                 let tracker = &shared.workspaces[&id];
@@ -1657,7 +1672,12 @@ fn coordinator(hub: Hub) {
                     .last_change
                     .map(|at| at.elapsed() >= Duration::from_millis(shared.config.debounce_ms))
                     .unwrap_or(true);
-                (debounced, shared.paused, tracker.running.is_some())
+                (
+                    debounced,
+                    shared.paused,
+                    tracker.running.is_some(),
+                    shared.config.full_on_config_change,
+                )
             };
             if !debounced || paused || busy {
                 continue;
@@ -1665,12 +1685,12 @@ fn coordinator(hub: Hub) {
             // Resolve without the lock: reading every file is the slow part. The Python and the
             // JavaScript sides resolve independently, and only the side the panel switched on is read.
             let resolution = if watch.python {
-                resolve_targets(&folder, &pending.iter().cloned().collect())
+                resolve_targets(&folder, &pending.iter().cloned().collect(), full_on_config_change)
             } else {
                 Resolution::NoTests
             };
             let js_resolution = if watch.javascript {
-                resolve_jsts(&folder, &pending.iter().cloned().collect())
+                resolve_jsts(&folder, &pending.iter().cloned().collect(), full_on_config_change)
             } else {
                 Resolution::NoTests
             };
@@ -1860,20 +1880,20 @@ fn is_test_file(path: &Path) -> bool {
     name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"))
 }
 
-fn resolve_targets(folder: &Path, changed: &BTreeSet<PathBuf>) -> Resolution {
+fn resolve_targets(folder: &Path, changed: &BTreeSet<PathBuf>, full_on_config_change: bool) -> Resolution {
     let mut targets: BTreeSet<PathBuf> = BTreeSet::new();
     let mut seeds: BTreeSet<PathBuf> = BTreeSet::new();
     let mut full = false;
     for path in changed {
         let name = path.file_name().and_then(|one| one.to_str()).unwrap_or("");
         if matches!(name, "pyproject.toml" | "pytest.ini" | "tox.ini" | "setup.cfg") {
-            full = true;
+            full = full_on_config_change;
         } else if name == "conftest.py" {
             match path.parent() {
                 Some(parent) if !parent.as_os_str().is_empty() => {
                     targets.insert(parent.to_path_buf());
                 }
-                _ => full = true,
+                _ => full = full_on_config_change,
             }
         } else if name.ends_with(".py") {
             seeds.insert(path.clone());
@@ -2454,13 +2474,15 @@ fn jsts_dependents_of(folder: &Path) -> HashMap<PathBuf, BTreeSet<PathBuf>> {
 
 /// A change in the JavaScript world to the tests that cover it: the same reading pytest gets, over a
 /// graph parsed from `import`, `export` and `require`.
-fn resolve_jsts(folder: &Path, changed: &BTreeSet<PathBuf>) -> Resolution {
+fn resolve_jsts(folder: &Path, changed: &BTreeSet<PathBuf>, full_on_config_change: bool) -> Resolution {
     let mut targets: BTreeSet<PathBuf> = BTreeSet::new();
     let mut seeds: BTreeSet<PathBuf> = BTreeSet::new();
     for path in changed {
         let name = path.file_name().and_then(|one| one.to_str()).unwrap_or("");
         if matches!(name, "tsconfig.json" | "package.json") {
-            return Resolution::Full;
+            if full_on_config_change {
+                return Resolution::Full;
+            }
         } else if has_jsts_extension(name) {
             seeds.insert(path.clone());
         }
@@ -3161,6 +3183,7 @@ fn settings_view_of(shared: &Shared) -> Value {
         "intervalMs": shared.config.interval_ms,
         "debounceMs": shared.config.debounce_ms,
         "timeoutS": shared.config.timeout_s,
+        "fullOnConfigChange": shared.config.full_on_config_change,
     })
 }
 
@@ -3470,6 +3493,22 @@ mod tests {
     }
 
     #[test]
+    fn a_deep_change_pulls_in_only_the_tests_that_cover_it() {
+        let project = Scratch::new("deep-closure");
+        project.write("lib.py", "X = 1\n");
+        project.write("fun.py", "from lib import X\n");
+        project.write("tests/test_fun.py", "from fun import X\n\ndef test_fun():\n    assert X == 1\n");
+        project.write("tests/test_other.py", "def test_other():\n    assert True\n");
+        let files: BTreeSet<PathBuf> = [PathBuf::from("lib.py")].into_iter().collect();
+        match resolve_targets(&project.0, &files, false) {
+            Resolution::Targets(targets) => {
+                assert_eq!(targets, vec![PathBuf::from("tests/test_fun.py")]);
+            }
+            _ => panic!("a change to lib.py should resolve through fun.py to only test_fun.py"),
+        }
+    }
+
+    #[test]
     fn a_changed_module_pulls_in_the_test_that_imports_it() {
         let project = Scratch::new("closure");
         project.write("pkg/calc.py", "def add(a, b):\n    return a + b\n");
@@ -3479,14 +3518,14 @@ mod tests {
         );
         project.write("pkg/unused.py", "X = 1\n");
         let files: BTreeSet<PathBuf> = [PathBuf::from("pkg/calc.py")].into_iter().collect();
-        match resolve_targets(&project.0, &files) {
+        match resolve_targets(&project.0, &files, false) {
             Resolution::Targets(targets) => {
                 assert_eq!(targets, vec![PathBuf::from("tests/test_calc.py")]);
             }
             _ => panic!("a covered source file should resolve to its test"),
         }
         let files: BTreeSet<PathBuf> = [PathBuf::from("pkg/unused.py")].into_iter().collect();
-        assert!(matches!(resolve_targets(&project.0, &files), Resolution::NoTests));
+        assert!(matches!(resolve_targets(&project.0, &files, false), Resolution::NoTests));
     }
 
     #[test]
@@ -3495,14 +3534,15 @@ mod tests {
         project.write("tests/test_a.py", "def test_a():\n    pass\n");
         project.write("conftest.py", "");
         let files: BTreeSet<PathBuf> = [PathBuf::from("tests/test_a.py")].into_iter().collect();
-        match resolve_targets(&project.0, &files) {
+        match resolve_targets(&project.0, &files, false) {
             Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("tests/test_a.py")]),
             _ => panic!("a changed test file covers itself"),
         }
         let files: BTreeSet<PathBuf> = [PathBuf::from("pyproject.toml")].into_iter().collect();
-        assert!(matches!(resolve_targets(&project.0, &files), Resolution::Full));
+        assert!(matches!(resolve_targets(&project.0, &files, false), Resolution::NoTests));
+        assert!(matches!(resolve_targets(&project.0, &files, true), Resolution::Full));
         let files: BTreeSet<PathBuf> = [PathBuf::from("conftest.py")].into_iter().collect();
-        assert!(matches!(resolve_targets(&project.0, &files), Resolution::Full));
+        assert!(matches!(resolve_targets(&project.0, &files, true), Resolution::Full));
     }
 
     #[test]
@@ -3515,12 +3555,12 @@ mod tests {
             "from pkg import one  # a comment\nfrom pkg.two import (\n    Y,\n)\nimport pkg.one\n\ndef test_three():\n    assert one.X + Y == 3\n",
         );
         let files: BTreeSet<PathBuf> = [PathBuf::from("pkg/one.py")].into_iter().collect();
-        match resolve_targets(&project.0, &files) {
+        match resolve_targets(&project.0, &files, false) {
             Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("tests/test_three.py")]),
             _ => panic!("the import forms should reach the test"),
         }
         let files: BTreeSet<PathBuf> = [PathBuf::from("pkg/two.py")].into_iter().collect();
-        match resolve_targets(&project.0, &files) {
+        match resolve_targets(&project.0, &files, false) {
             Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("tests/test_three.py")]),
             _ => panic!("a parenthesised continuation should reach the test"),
         }
@@ -3563,6 +3603,7 @@ mod tests {
             interval_ms: Some(900),
             debounce_ms: Some(300),
             timeout_s: Some(30),
+            full_on_config_change: Some(true),
             watch: BTreeMap::new(),
         };
         saved.watch.insert("one".to_string(), Watch { python: true, javascript: false });
@@ -3572,9 +3613,11 @@ mod tests {
         saved.write(&path).unwrap();
         let read = Settings::read(&path);
         assert_eq!(read.interval_ms, Some(900));
+        assert_eq!(read.full_on_config_change, Some(true));
         assert_eq!(read.watch.get("one").copied(), Some(Watch { python: true, javascript: false }));
         assert_eq!(read.watch.get("two").copied(), Some(Watch { python: false, javascript: true }));
         let config = resolve(Given::default(), Some(read)).unwrap();
+        assert!(config.full_on_config_change);
         assert_eq!(config.watch.get("two").copied(), Some(Watch { python: false, javascript: true }));
         // A folder nobody spoke for is watched for nothing at all.
         assert_eq!(config.watch.get("three").copied(), None);
@@ -3624,14 +3667,15 @@ mod tests {
         let specs = jsts_imports_of("import { a } from './a';\nimport './side';\nexport * from \"./re\";\nconst { b } = require('./req');\nconst c = import('./dyn');\n/* import { x } from './hidden'; */\nimport {\n  d\n} from './multi';\n");
         assert_eq!(specs, vec!["./a", "./side", "./re", "./req", "./dyn", "./multi"]);
         let files: BTreeSet<PathBuf> = [PathBuf::from("src/calc.ts")].into_iter().collect();
-        match resolve_jsts(&project.0, &files) {
+        match resolve_jsts(&project.0, &files, false) {
             Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("src/calc.test.ts")]),
             _ => panic!("a covered source file should resolve to its test"),
         }
         let files: BTreeSet<PathBuf> = [PathBuf::from("src/other.ts")].into_iter().collect();
-        assert!(matches!(resolve_jsts(&project.0, &files), Resolution::NoTests));
+        assert!(matches!(resolve_jsts(&project.0, &files, false), Resolution::NoTests));
         let files: BTreeSet<PathBuf> = [PathBuf::from("tsconfig.json")].into_iter().collect();
-        assert!(matches!(resolve_jsts(&project.0, &files), Resolution::Full));
+        assert!(matches!(resolve_jsts(&project.0, &files, false), Resolution::NoTests));
+        assert!(matches!(resolve_jsts(&project.0, &files, true), Resolution::Full));
         assert!(is_jsts_test_file(&PathBuf::from("src/calc.test.ts")));
         assert!(is_jsts_test_file(&PathBuf::from("test-utils.test.js")));
         assert!(!is_jsts_test_file(&PathBuf::from("src/calc.ts")));
@@ -3665,7 +3709,7 @@ mod tests {
         project.write("src/other.ts", "const note = \"příliš žluťoučký kůň\";\nexport const x = 1;\n");
         project.write("src/calc.test.ts", "import { add } from \"./calc\";\nimport \"node:test\";\n");
         let files: BTreeSet<PathBuf> = [PathBuf::from("src/calc.ts")].into_iter().collect();
-        match resolve_jsts(&project.0, &files) {
+        match resolve_jsts(&project.0, &files, false) {
             Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("src/calc.test.ts")]),
             _ => panic!("a letter outside ASCII elsewhere in the folder should not stop the resolution"),
         }

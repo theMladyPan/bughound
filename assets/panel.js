@@ -33,7 +33,12 @@ const setNoteEl = document.getElementById("setNote");
 const saveSettingsBtn = document.getElementById("saveSettings");
 const watchPythonEl = document.getElementById("watchPython");
 const watchJavascriptEl = document.getElementById("watchJavascript");
+const fullConfigEl = document.getElementById("fullOnConfigChange");
 const watchNoteEl = document.getElementById("watchNote");
+const panelMainEl = document.querySelector(".panel-main");
+const selectedEl = document.getElementById("selected");
+const selectedSplitterEl = document.getElementById("selectedSplitter");
+const laneSplitterEl = document.getElementById("laneSplitter");
 const laneScrollEl = document.getElementById("laneScroll");
 const plotEl = document.getElementById("plot");
 const plotTracksEl = document.getElementById("plotTracks");
@@ -70,10 +75,6 @@ let lastLoadedLogId = null;
 const laneButtons = new Map();
 let watchSaving = false;
 
-function closeDrawer() {
-  window.parent.postMessage({ type: "pi-studio.visual.close", nonce }, "*");
-}
-
 function ask(method, params = {}) {
   const id = (nextId += 1);
   return new Promise((resolve, reject) => {
@@ -87,12 +88,8 @@ function lanesFrom(state) {
 }
 
 function selectedLane(state) {
-  const lanes = lanesFrom(state);
-  return lanes.find((lane) => lane.id === selectedId)
-    || lanes.find((lane) => lane.phase === "running")
-    || lanes.find((lane) => lane.phase === "debouncing")
-    || lanes[0]
-    || null;
+  if (!selectedId) return null;
+  return lanesFrom(state).find((lane) => lane.id === selectedId) || null;
 }
 
 function phaseLabel(row) {
@@ -129,7 +126,7 @@ async function loadLog(state, lane) {
   try {
     const answer = await ask("log", { workspace: lane.id });
     if (selectedFailure && selectedFailure.laneId === lane.id) return;
-    logEl.textContent = answer.text || "";
+    logEl.textContent = answer.text || "No check output yet.";
   } catch (err) {
     logEl.textContent = err.message || "the log is not there yet";
   }
@@ -277,13 +274,29 @@ function render(state) {
   buildLaneButtons(lanes);
   if (selectedFailure && !lanes.some((lane) => lane.id === selectedFailure.laneId)) selectedFailure = null;
 
+  const hasSelection = Boolean(row);
+  selectedEl.hidden = !hasSelection;
+  selectedSplitterEl.hidden = !hasSelection;
+  panelMainEl.classList.toggle("no-selected", !hasSelection);
   if (!row) {
     dotEl.className = "dot";
     metaEl.textContent = "the daemon knows no workspace for this board";
     pendingEl.hidden = true;
+    runAllBtn.disabled = true;
     runFailedBtn.hidden = true;
+    pauseBtn.textContent = state.paused ? "resume" : "pause";
+    watchPythonEl.disabled = true;
+    watchJavascriptEl.disabled = true;
+    watchNoteEl.textContent = "select a worktree to set its switches";
     logContextEl.textContent = "";
     logEl.textContent = "";
+    if (state?.settings && document.activeElement !== setIntervalEl && document.activeElement !== setDebounceEl && document.activeElement !== setTimeoutEl && document.activeElement !== fullConfigEl) {
+      setIntervalEl.value = state.settings.intervalMs;
+      setDebounceEl.value = state.settings.debounceMs;
+      setTimeoutEl.value = state.settings.timeoutS;
+      fullConfigEl.checked = state.settings.fullOnConfigChange === true;
+    }
+    drawTimeline();
     return;
   }
 
@@ -295,6 +308,8 @@ function render(state) {
     watchPythonEl.checked = watch.python === true;
     watchJavascriptEl.checked = watch.javascript === true;
   }
+  watchPythonEl.disabled = false;
+  watchJavascriptEl.disabled = false;
   watchNoteEl.textContent = describeWatch(watch);
   runAllBtn.disabled = watch.python !== true && watch.javascript !== true;
   const bits = [row.name || row.id];
@@ -308,17 +323,18 @@ function render(state) {
   pendingEl.hidden = pending.length === 0;
   if (pending.length) pendingEl.textContent = pending.join("\n");
 
-  if (state?.settings && document.activeElement !== setIntervalEl && document.activeElement !== setDebounceEl && document.activeElement !== setTimeoutEl) {
+  if (state?.settings && document.activeElement !== setIntervalEl && document.activeElement !== setDebounceEl && document.activeElement !== setTimeoutEl && document.activeElement !== fullConfigEl) {
     setIntervalEl.value = state.settings.intervalMs;
     setDebounceEl.value = state.settings.debounceMs;
     setTimeoutEl.value = state.settings.timeoutS;
+    fullConfigEl.checked = state.settings.fullOnConfigChange === true;
   }
   pauseBtn.textContent = state.paused ? "resume" : "pause";
   runFailedBtn.hidden = !last || last.status === "passed" || last.status === "no_tests";
 
   if (selectedFailure) {
     logContextEl.textContent = `${row.name} · ${selectedFailure.nodeid} · ${timeAgo(selectedFailure.atMs, nowMs)}`;
-    logEl.textContent = selectedFailure.log || "";
+    logEl.textContent = selectedFailure.log || "No check output yet.";
   } else {
     logContextEl.textContent = `${row.name} · ${row.threadId || "pytest"} · ${last ? new Date(last.at).toLocaleTimeString() : "Latest run"}`;
     void loadLog(state, row);
@@ -356,6 +372,49 @@ async function triggerRun(scope) {
     metaEl.textContent = err.message;
   }
 }
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function dragSplitter(handle, start, move) {
+  handle.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    try {
+      handle.setPointerCapture(event.pointerId);
+    } catch (error) {
+      // synthetic pointer events have no capture target
+    }
+    handle.classList.add("dragging");
+    const startX = event.clientX;
+    const startValue = start();
+    const onMove = (moveEvent) => move(startValue, moveEvent.clientX - startX);
+    const onEnd = () => {
+      handle.classList.remove("dragging");
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onEnd);
+      handle.removeEventListener("pointercancel", onEnd);
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onEnd);
+    handle.addEventListener("pointercancel", onEnd);
+  });
+}
+
+let laneColumnPx = 180;
+dragSplitter(laneSplitterEl, () => laneColumnPx, (start, delta) => {
+  laneColumnPx = clampNumber(start + delta, 112, 320);
+  document.documentElement.style.setProperty("--lane-column", `${laneColumnPx}px`);
+  drawTimeline();
+});
+
+let timelineShare = 61.8;
+dragSplitter(selectedSplitterEl, () => timelineShare, (start, delta) => {
+  const width = Math.max(1, panelMainEl.clientWidth - 6);
+  timelineShare = clampNumber(start + (delta / width) * 100, 30, 80);
+  document.documentElement.style.setProperty("--timeline-share", `${timelineShare}%`);
+  drawTimeline();
+});
 
 plotEl.addEventListener("wheel", (event) => {
   event.preventDefault();
@@ -408,9 +467,10 @@ saveSettingsBtn.addEventListener("click", async () => {
   if (Number.isFinite(interval)) params.intervalMs = interval;
   if (Number.isFinite(debounce)) params.debounceMs = debounce;
   if (Number.isFinite(timeout)) params.timeoutS = timeout;
+  params.fullOnConfigChange = fullConfigEl.checked;
   try {
     const answer = await ask("set_config", params);
-    setNoteEl.textContent = answer.ok ? `saved: ${answer.settings.intervalMs}ms · ${answer.settings.debounceMs}ms · ${answer.settings.timeoutS}s` : "not saved";
+    setNoteEl.textContent = answer.ok ? `saved: ${answer.settings.intervalMs}ms · ${answer.settings.debounceMs}ms · ${answer.settings.timeoutS}s · full on config: ${answer.settings.fullOnConfigChange}` : "not saved";
   } catch (err) {
     setNoteEl.textContent = err.message;
   }
@@ -431,16 +491,5 @@ async function saveWatch() {
 
 watchPythonEl.addEventListener("change", () => void saveWatch());
 watchJavascriptEl.addEventListener("change", () => void saveWatch());
-
-window.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") {
-    event.preventDefault();
-    closeDrawer();
-  } else if (!event.metaKey && !event.ctrlKey && !event.altKey) {
-    if (event.key === "r") { event.preventDefault(); void triggerRun("all"); }
-    else if (event.key === "f" && !runFailedBtn.hidden) { event.preventDefault(); void triggerRun("failed"); }
-    else if (event.key === "p") { event.preventDefault(); pauseBtn.click(); }
-  }
-});
 
 window.addEventListener("resize", drawTimeline);
