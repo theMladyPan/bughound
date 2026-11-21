@@ -1,6 +1,6 @@
 {
   "name": "bughound",
-  "version": "2.1.0",
+  "version": "0.2.0",
   "protocol": 1,
   "protocolMinor": 0,
   "minPiStudio": "0.6.0",
