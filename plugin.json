@@ -1,11 +1,11 @@
 {
   "name": "bughound",
-  "version": "2.0.0",
+  "version": "0.2.0",
   "protocol": 1,
   "protocolMinor": 0,
   "minPiStudio": "0.6.0",
   "title": "bughound",
-  "description": "Watches a workspace for file changes and immediately runs the targeted pytest for a file a test covers.",
+  "description": "Watches a workspace folder for the tests you switch on for it, and immediately runs the targeted ones for a file a test covers.",
   "command": "target/release/pi-studio-bughound",
   "start": "eager",
   "shortcut": "b",

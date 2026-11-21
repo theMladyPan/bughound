@@ -32,6 +32,8 @@ const binary = process.env.BUGHOUND_BIN ?? join(here, "..", "target", "release",
 
 const root = mkdtempSync(join(tmpdir(), "pi-studio-bughound-host-"));
 const folder = join(root, "project");
+// A throwaway settings file: the switches a check ticks must not land in the human's own state folder.
+const settingsPath = join(root, "bughound.json");
 const WS = "workspace-watched";
 
 // A fake pytest: it passes, until a FAIL file appears in the folder it runs in, and says why, in the
@@ -148,10 +150,18 @@ async function until(what, seen, timeoutMs = 15_000) {
 async function started() {
 	const server = daemon();
 	const host = await startPlugin(
-		{ name: "bughound", command: binary, args: ["--interval-ms", "250", "--debounce-ms", "100", "--pytest", fakePytest, "--node", fakeNode, "--tsc", fakeTsc] },
+		{ name: "bughound", command: binary, args: ["--interval-ms", "250", "--debounce-ms", "100", "--settings", settingsPath, "--pytest", fakePytest, "--node", fakeNode, "--tsc", fakeTsc] },
 		{ log: quiet, onRequest: server.answer },
 	);
 	return { host, ...server };
+}
+
+/** The panel's own switches, one call each, exactly as a tick in the drawer makes them. */
+async function switchOn(host) {
+	const python = await host.request("visual.request", { workspace: WS, method: "set_watch", params: { python: true } });
+	assert.equal(python.ok, true);
+	const javascript = await host.request("visual.request", { workspace: WS_TS, method: "set_watch", params: { javascript: true } });
+	assert.equal(javascript.ok, true);
 }
 
 test("a daemon starts the plugin, and it asks for the workspaces and the settled runs", async () => {
@@ -167,9 +177,28 @@ test("a daemon starts the plugin, and it asks for the workspaces and the settled
 	}
 });
 
+test("a workspace with nothing switched on is watched for nothing, and says so", async () => {
+	const { host } = await started();
+	try {
+		// The state a fresh install is in: the folder is known, and nothing is read from it.
+		const state = await host.request("visual.request", { workspace: WS, method: "state", params: {} });
+		const row = state.workspaces.find((one) => one.id === WS);
+		assert.deepEqual(row.watch, { python: false, javascript: false }, "both sides start off");
+		assert.equal(row.lastScanAt, null, "an unwatched folder is never walked");
+		assert.equal(row.phase, "off");
+		// run all has nothing to run, and hands back the reason the panel shows.
+		const run = await host.request("visual.request", { workspace: WS, method: "run", params: { scope: "all" } });
+		assert.equal(run.queued, false);
+		assert.match(run.reason, /nothing is switched on/);
+	} finally {
+		await host.close();
+	}
+});
+
 test("a TypeScript workspace is watched, type-encoded, and its failure card goes when it heals", async (t) => {
 	const { host, calls } = await started();
 	try {
+		await switchOn(host);
 		await until("the baseline scanned", async () => {
 			const state = await host.request("visual.request", { workspace: WS_TS, method: "state", params: {} });
 			return state.workspaces?.find((one) => one.id === WS_TS)?.lastScanAt != null;
@@ -215,6 +244,7 @@ test("a TypeScript workspace is watched, type-encoded, and its failure card goes
 test("the panel's state names the watched workspace, and an edit runs its covering test", async (t) => {
 	const { host } = await started();
 	try {
+		await switchOn(host);
 		// The first scan is a baseline and runs nothing, so the edit below waits for it to have happened.
 		await until("the baseline scanned", async () => {
 			const state = await host.request("visual.request", { workspace: WS, method: "state", params: {} });

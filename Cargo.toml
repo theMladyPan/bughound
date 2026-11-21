@@ -1,8 +1,8 @@
 [package]
 name = "pi-studio-bughound"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "An optional pi-studio plugin: watches a workspace folder and runs the targeted pytest for a file that changed"
+description = "An optional pi-studio plugin: watches a workspace folder for the tests you switch on for it, and runs the targeted ones for a file a test covers"
 publish = false
 
 [dependencies]

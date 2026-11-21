@@ -10,8 +10,9 @@
  *
  * `state` is what the page reads, so the page polls it: every second while a run is in flight, every
  * two and a half otherwise. `run` queues a manual run (`scope` is "all" or "failed"), `toggle_pause`
- * pauses or resumes the watching, and `log` hands back the last output. The board adds the workspace
- * this tab belongs to, so nothing here names a folder.
+ * pauses or resumes the watching, and `log` hands back the last output. Esc asks the board to close the
+ * drawer, beside its own « button. The board adds the workspace this tab belongs to, so nothing here
+ * names a folder.
  */
 let nonce = "";
 let nextId = 0;
@@ -26,19 +27,24 @@ const runAllBtn = document.getElementById("runAll");
 const runFailedBtn = document.getElementById("runFailed");
 const pauseBtn = document.getElementById("pause");
 const copyBtn = document.getElementById("copy");
-const closeBtn = document.getElementById("close");
 const setIntervalEl = document.getElementById("setInterval");
 const setDebounceEl = document.getElementById("setDebounce");
 const setTimeoutEl = document.getElementById("setTimeout");
 const setNoteEl = document.getElementById("setNote");
 const saveSettingsBtn = document.getElementById("saveSettings");
+const watchPythonEl = document.getElementById("watchPython");
+const watchJavascriptEl = document.getElementById("watchJavascript");
+const watchNoteEl = document.getElementById("watchNote");
 
 let pollTimer = 0;
 let pollBusy = false;
 let currentState = null;
 let lastLoadedLogId = null;
+// A tick is on its way to the plugin: the next poll must not put the old value back under the hand.
+let watchSaving = false;
 
 function closeDrawer() {
+  // The board's own « does the same thing by calling it directly; this is how Esc arrives.
   window.parent.postMessage({ type: "pi-studio.visual.close", nonce }, "*");
 }
 
@@ -63,6 +69,13 @@ async function loadLog(state, workspace) {
   }
 }
 
+function describeWatch(watch) {
+  const on = [];
+  if (watch?.python) on.push("python tests");
+  if (watch?.javascript) on.push("javascript tests");
+  return on.length ? `watching ${on.join(" and ")}` : "nothing is switched on for this folder: no scan, no run, no card";
+}
+
 function render(state) {
   currentState = state;
   const workspaces = Array.isArray(state?.workspaces) ? state.workspaces : [];
@@ -80,8 +93,16 @@ function render(state) {
   const phase = found.phase || "idle";
   phaseEl.textContent = phase;
   dotEl.className = "dot" + (phase === "running" || phase === "debouncing" ? " work" : last?.status === "failed" ? " bad" : last?.status === "passed" ? " ok" : "");
+  const watch = found.watch || { python: false, javascript: false };
+  if (!watchSaving) {
+    watchPythonEl.checked = watch.python === true;
+    watchJavascriptEl.checked = watch.javascript === true;
+  }
+  watchNoteEl.textContent = describeWatch(watch);
+  runAllBtn.disabled = watch.python !== true && watch.javascript !== true;
   const bits = [found.name || found.id];
   if (found.folder) bits.push(found.folder);
+  if (watch.python !== true && watch.javascript !== true) bits.push("nothing switched on");
   if (found.lastScanAt) bits.push(`scanned ${new Date(found.lastScanAt).toLocaleTimeString()}`);
   if (last) bits.push(`${last.status} · ${last.summary} · ${new Date(last.at).toLocaleTimeString()}`);
   metaEl.textContent = bits.join(" · ");
@@ -123,7 +144,8 @@ function schedulePoll() {
 
 async function triggerRun(scope) {
   try {
-    await ask("run", { scope });
+    const answer = await ask("run", { scope });
+    if (answer && answer.queued === false && answer.reason) metaEl.textContent = answer.reason;
     await poll();
   } catch (err) {
     metaEl.textContent = err.message;
@@ -152,7 +174,6 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && nonce) void poll();
 });
 
-closeBtn.addEventListener("click", closeDrawer);
 runAllBtn.addEventListener("click", () => void triggerRun("all"));
 runFailedBtn.addEventListener("click", () => void triggerRun("failed"));
 pauseBtn.addEventListener("click", async () => {
@@ -181,6 +202,25 @@ saveSettingsBtn.addEventListener("click", async () => {
     setNoteEl.textContent = err.message;
   }
 });
+
+// A tick is saved the moment it is made: the settings page has no save button for the watch, because
+// a folder that stops being watched should stop now, and a folder that starts should start now.
+async function saveWatch() {
+  watchSaving = true;
+  try {
+    const answer = await ask("set_watch", { python: watchPythonEl.checked, javascript: watchJavascriptEl.checked });
+    watchNoteEl.textContent = describeWatch(answer.watch);
+  } catch (err) {
+    watchNoteEl.textContent = err.message || "not saved";
+  } finally {
+    watchSaving = false;
+  }
+  await poll();
+}
+
+watchPythonEl.addEventListener("change", () => void saveWatch());
+watchJavascriptEl.addEventListener("change", () => void saveWatch());
+
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     event.preventDefault();

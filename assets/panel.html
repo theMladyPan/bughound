@@ -11,10 +11,11 @@
     it nor the daemon behind it: every call it makes is one message to the board, which asks the plugin
     through the daemon. `panel.js` holds that conversation. The board adds the workspace this tab
     belongs to, so the page never names a folder.
+
+    No close button of its own here: in the drawers the board already draws the rail's head with its
+    « close. Pressing it or Esc is the same door out, and `panel.js` asks the board to close.
   -->
-  <div class="rail-head"><span class="dot" id="dot"></span><span id="phase">starting</span>
-    <button type="button" class="rail-close" id="close" title="hide the drawer (esc)">«</button>
-  </div>
+  <div class="rail-head"><span class="dot" id="dot"></span><span id="phase">starting</span></div>
   <div class="bh-meta" id="meta" role="status">waiting for the board</div>
   <div class="bh-actions">
     <button type="button" id="runAll" title="run the whole suite now (r)">▶ run all</button>
@@ -24,6 +25,13 @@
   </div>
   <details class="bh-settings" id="settings">
     <summary>settings</summary>
+    <!-- What this folder is watched for. Both start off: nothing is scanned and nothing is run until
+         one is ticked, and the tick belongs to this board's folder alone. -->
+    <div class="bh-actions">
+      <label><input type="checkbox" id="watchPython"> python tests</label>
+      <label><input type="checkbox" id="watchJavascript"> javascript tests</label>
+    </div>
+    <p class="bh-note" id="watchNote" role="status"></p>
     <div class="bh-actions">
       <label>interval <input type="number" id="setInterval" min="250" step="250"></label>
       <label>debounce <input type="number" id="setDebounce" min="0" step="100"></label>
