@@ -10,8 +10,9 @@
  *
  * `state` is what the page reads, so the page polls it: every second while a run is in flight, every
  * two and a half otherwise. `run` queues a manual run (`scope` is "all" or "failed"), `toggle_pause`
- * pauses or resumes the watching, and `log` hands back the last output. The board adds the workspace
- * this tab belongs to, so nothing here names a folder.
+ * pauses or resumes the watching, and `log` hands back the last output. Esc asks the board to close the
+ * drawer, beside its own « button. The board adds the workspace this tab belongs to, so nothing here
+ * names a folder.
  */
 let nonce = "";
 let nextId = 0;
@@ -26,7 +27,6 @@ const runAllBtn = document.getElementById("runAll");
 const runFailedBtn = document.getElementById("runFailed");
 const pauseBtn = document.getElementById("pause");
 const copyBtn = document.getElementById("copy");
-const closeBtn = document.getElementById("close");
 const setIntervalEl = document.getElementById("setInterval");
 const setDebounceEl = document.getElementById("setDebounce");
 const setTimeoutEl = document.getElementById("setTimeout");
@@ -44,6 +44,7 @@ let lastLoadedLogId = null;
 let watchSaving = false;
 
 function closeDrawer() {
+  // The board's own « does the same thing by calling it directly; this is how Esc arrives.
   window.parent.postMessage({ type: "pi-studio.visual.close", nonce }, "*");
 }
 
@@ -173,7 +174,6 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && nonce) void poll();
 });
 
-closeBtn.addEventListener("click", closeDrawer);
 runAllBtn.addEventListener("click", () => void triggerRun("all"));
 runFailedBtn.addEventListener("click", () => void triggerRun("failed"));
 pauseBtn.addEventListener("click", async () => {

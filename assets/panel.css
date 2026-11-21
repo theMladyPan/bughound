@@ -38,18 +38,6 @@ body {
   gap: 6px;
   align-items: center;
 }
-.rail-close {
-  margin-left: auto;
-  background: none;
-  border: none;
-  color: var(--muted);
-  cursor: pointer;
-  font: 12px var(--mono);
-  padding: 0 2px;
-  line-height: 1;
-}
-.rail-close:hover { color: var(--text); }
-
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
 .dot.ok { background: var(--green); }
 .dot.bad { background: var(--red); }
