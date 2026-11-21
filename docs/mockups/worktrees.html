@@ -31,9 +31,6 @@ code {font-family:var(--mono)}
 .pill {display:inline-flex;align-items:center;gap:6px;padding:3px 7px;border:1px solid var(--border);border-radius:4px;background:var(--bg);font:11px/1.3 var(--mono)}
 .mark {height:8px;width:8px;border-radius:50%;background:currentColor;display:inline-block;flex:none}
 .scan {color:var(--accent)} .settle {color:var(--amber)} .run {color:var(--violet)} .idle {color:var(--muted)} .fail {color:var(--red)} .pass {color:var(--green)}
-.zoom {display:flex;align-items:center;gap:8px;margin-left:auto;color:var(--muted);font:11px var(--mono)}
-.zoom button {min-width:28px;padding:2px 5px;background:var(--card);border:1px solid var(--border);border-radius:4px}
-.zoom button:disabled {opacity:.5;cursor:default}
 .timeline {display:grid;grid-template-columns:clamp(136px,24%,220px) minmax(0,1fr);grid-template-rows:20px repeat(4,44px) auto;--lane-height:44px;padding:9px 14px;background:var(--drawer)}
 .plot-scroll {grid-column:2;grid-row:1 / 7;overflow-x:auto;min-width:0;scrollbar-width:none}.plot-scroll::-webkit-scrollbar {display:none}body:not(.mock-motion) #plot-scroll {scrollbar-color:transparent transparent}
 .plot-scroll:focus-visible {outline:2px solid var(--accent);outline-offset:-2px}
@@ -79,14 +76,11 @@ code {font-family:var(--mono)}
 <section class="dock" aria-labelledby="dock-title">
   <header class="dock-bar"><h1 id="dock-title">Bughound activity timeline</h1><button id="dock-toggle" type="button" aria-controls="dock-body" aria-expanded="true">Roll down</button></header>
   <div class="dock-body" id="dock-body">
-    <section aria-label="Last 60 simulated seconds" class="mock-motion">
-      <div class="summary">
-        <div class="zoom" role="group" aria-label="Timeline zoom"><button id="zoom-out" type="button" aria-label="Zoom out" disabled>−</button><output id="zoom-level" aria-label="Zoom level">1×</output><button id="zoom-in" type="button" aria-label="Zoom in">+</button></div>
-      </div>
+    <section aria-label="Last 60 simulated seconds, zoomable to 30 minutes" class="mock-motion">
       <div id="timeline" class="timeline">
-        <div class="plot-scroll" id="plot-scroll" role="region" aria-label="Scrollable timeline" tabindex="0">
+        <div class="plot-scroll" id="plot-scroll" tabindex="0" aria-label="Timeline. Scroll to zoom.">
           <div class="plot" id="plot">
-            <div class="ticks" aria-hidden="true"><span>−60s</span><span>−40s</span><span>−20s</span><span>Now</span></div>
+            <div class="ticks" id="ticks" aria-hidden="true"><span>−60s</span><span>−40s</span><span>−20s</span><span>Now</span></div>
             <div class="plot-tracks" id="plot-tracks"><canvas id="timeline-art" aria-hidden="true"></canvas></div>
           </div>
         </div>
@@ -105,7 +99,7 @@ code {font-family:var(--mono)}
 const $ = id => document.getElementById(id);
 const phase = {scan:'Scanning',settle:'Edits settling',run:'Running checks',idle:'Idle',pass:'Passed'};
 const color = {scan:'#58a6ff',settle:'#e3b341',run:'#d2a8ff',pass:'#7ee08c'};
-const workspaceFailure = {time:15,test:'tests/test_workspace.py::test_discovers_enabled_suites',log:`F                                                                [100%]
+const workspaceFailure = {time:1755,test:'tests/test_workspace.py::test_discovers_enabled_suites',log:`F                                                                [100%]
 =============================== FAILURES ===============================
 ____________________ test_discovers_enabled_suites _____________________
 tests/test_workspace.py:3: in test_discovers_enabled_suites
@@ -117,7 +111,7 @@ E     Use -v to get more diff
 ======================= short test summary info ========================
 FAILED tests/test_workspace.py::test_discovers_enabled_suites - Asser...
 1 failed in 0.02s`};
-const panelFailure = {time:39,test:'tests/test_panel.py::test_restores_focus_on_reopen',log:`F                                                                [100%]
+const panelFailure = {time:1779,test:'tests/test_panel.py::test_restores_focus_on_reopen',log:`F                                                                [100%]
 =============================== FAILURES ===============================
 ____________________ test_restores_focus_on_reopen _____________________
 tests/test_panel.py:3: in test_restores_focus_on_reopen
@@ -130,12 +124,13 @@ E     + board
 FAILED tests/test_panel.py::test_restores_focus_on_reopen - Assertion...
 1 failed in 0.02s`};
 const data = [
-  {id:'root',name:'Workspace root',stage:'scan',result:'Passed',log:'.                                                                [100%]\n1 passed in 0.02s',events:[[4,9,'scan'],[9,15,'run'],[24,31,'run'],[31,34,'pass'],[53,60,'scan']],failures:[workspaceFailure]},
-  {id:'1e724a28',name:'Release 0.7.0',stage:'settle',result:'No run yet',log:'No check output yet.',events:[[48,53,'scan'],[53,60,'settle']],failures:[]},
-  {id:'example-a',name:'Board shortcuts',stage:'run',result:'Passed',log:'...                                                              [100%]\n3 passed in 0.03s',events:[[5,10,'scan'],[10,18,'run'],[18,21,'pass'],[37,43,'scan'],[43,50,'settle'],[50,60,'run']],failures:[]},
-  {id:'example-b',name:'Plugin panel',stage:'idle',result:'1 failure',log:panelFailure.log,events:[[10,15,'scan'],[15,20,'settle'],[20,39,'run']],failures:[panelFailure]}
+  {id:'root',name:'Workspace root',stage:'scan',result:'Passed',log:'.                                                                [100%]\n1 passed in 0.02s',events:[[1744,1749,'scan'],[1749,1755,'run'],[1764,1771,'run'],[1771,1774,'pass'],[1793,1800,'scan']],failures:[workspaceFailure]},
+  {id:'1e724a28',name:'Release 0.7.0',stage:'settle',result:'No run yet',log:'No check output yet.',events:[[1788,1793,'scan'],[1793,1800,'settle']],failures:[]},
+  {id:'example-a',name:'Board shortcuts',stage:'run',result:'Passed',log:'...                                                              [100%]\n3 passed in 0.03s',events:[[1745,1750,'scan'],[1750,1758,'run'],[1758,1761,'pass'],[1777,1783,'scan'],[1783,1790,'settle'],[1790,1800,'run']],failures:[]},
+  {id:'example-b',name:'Plugin panel',stage:'idle',result:'1 failure',log:panelFailure.log,events:[[1750,1755,'scan'],[1755,1760,'settle'],[1760,1779,'run']],failures:[panelFailure]}
 ];
-let selected = 'example-b', zoom = 1, zoomTimer;
+const TOTAL_SECONDS = 1800, MIN_SECONDS = 60;
+let selected = 'example-b', visibleSeconds = MIN_SECONDS, zoomTimer;
 const buttons = [], markers = [];
 for (const [i,d] of data.entries()) {
   const button = document.createElement('button');
@@ -151,7 +146,7 @@ for (const [i,d] of data.entries()) {
     const marker = document.createElement('button');
     marker.type = 'button';
     marker.className = 'failure-dot';
-    marker.style.left = `clamp(13px, ${failure.time/60*100}%, calc(100% - 13px))`;
+    marker.style.left = `clamp(13px, ${(failure.time - (TOTAL_SECONDS - visibleSeconds))/visibleSeconds*100}%, calc(100% - 13px))`;
     marker.style.top = `${(i+.5)/data.length*100}%`;
     marker.title = `${timeLabel(failure.time)} · ${failure.test}`;
     marker.setAttribute('aria-label',`${d.name}, failure detected at ${timeLabel(failure.time)}: ${failure.test}`);
@@ -160,7 +155,25 @@ for (const [i,d] of data.entries()) {
     $('plot-tracks').append(marker);
   }
 }
-function timeLabel(time) { return time === 60 ? 'Now' : `−${60-time}s`; }
+function timeLabel(time) {
+  const secondsAgo = Math.max(0,TOTAL_SECONDS-time);
+  return secondsAgo === 0 ? 'Now' : `−${secondsAgo}s`;
+}
+function tickLabel(secondsAgo) { return secondsAgo === 0 ? 'Now' : `−${secondsAgo}s`; }
+function updateTicks() {
+  const [start,end] = windowRange();
+  const ticks = $('ticks');
+  for (let i=0;i<4;i++) {
+    ticks.children[i].textContent = tickLabel(Math.max(0,Math.round(visibleSeconds*(1-i/3))));
+  }
+}
+function windowRange() { return [TOTAL_SECONDS-visibleSeconds,TOTAL_SECONDS]; }
+function updateMarkers() {
+  const [start] = windowRange();
+  for (const [marker,failure] of markers) {
+    marker.style.left = `clamp(13px,${(failure.time-start)/visibleSeconds*100}%,calc(100% - 13px))`;
+  }
+}
 function pick(id, clickedFailure) {
   selected = id;
   const d = data.find(d => d.id === id);
@@ -182,10 +195,12 @@ function drawTimeline() {
   if (!w || !h) return;
   if (c.width !== w) c.width = w;
   if (c.height !== h) c.height = h;
+  const [start,end] = windowRange();
+  const px = value => (value-start)/(end-start)*w;
   g.clearRect(0,0,w,h);
   g.lineWidth = dpr;
   for (let i=0;i<=3;i++) {
-    const x = Math.min(w-dpr,(w-dpr)*i/3+dpr/2);
+    const x = Math.min(w-dpr,px(start + (end-start)*i/3)+dpr/2);
     g.strokeStyle = i === 3 ? '#596675' : '#30363d';
     g.beginPath(); g.moveTo(x,0); g.lineTo(x,h); g.stroke();
   }
@@ -193,33 +208,26 @@ function drawTimeline() {
     const y = (i+.5)*h/data.length;
     g.fillStyle = d.id === selected ? '#142339' : '#161b22'; g.fillRect(0,y-13*dpr,w,26*dpr);
     for (const [from,to,s] of d.events) {
-      const x = from*w/60, end = to*w/60;
-      g.fillStyle = color[s]; g.fillRect(x,y-4*dpr,Math.max(1,end-x-dpr),8*dpr);
+      const x = px(from), eventEnd = px(to);
+      if (eventEnd <= 0 || x >= w) continue;
+      g.fillStyle = color[s]; g.fillRect(x,y-4*dpr,Math.max(1,Math.min(eventEnd,w)-Math.max(x,0)-dpr),8*dpr);
     }
-
   }
+  updateMarkers();
+  updateTicks();
 }
-function changeZoom(next, pinRight=true) {
-  const scroll = $('plot-scroll');
-  zoom = next;
-  $('plot').style.width = `${zoom*100}%`;
-  scroll.scrollTo({left:pinRight ? 999999 : 0,behavior:'instant'});
-  $('zoom-level').textContent = `${zoom}×`;
-  $('zoom-out').disabled = zoom === 1;
-  $('zoom-in').disabled = zoom === 4;
+function changeZoom(nextSeconds) {
+  visibleSeconds = Math.min(TOTAL_SECONDS,Math.max(MIN_SECONDS,nextSeconds));
   drawTimeline();
 }
 $('plot-scroll').addEventListener('wheel',event => {
   event.preventDefault();
-  const zoomingIn = event.deltaY > 0;
-  const next = Math.min(4,Math.max(1,zoom*(zoomingIn ? 2 : .5)));
-  if (next === zoom) return;
-  changeZoom(next,zoomingIn);
+  const nextVisibleSeconds = Math.min(TOTAL_SECONDS,Math.max(MIN_SECONDS,Math.round(visibleSeconds*(event.deltaY > 0 ? 2 : .5))));
+  if (nextVisibleSeconds === visibleSeconds) return;
+  changeZoom(nextVisibleSeconds);
   clearTimeout(zoomTimer);
-  zoomTimer = setTimeout(drawTimeline,100);
+  zoomTimer = setTimeout(drawTimeline,50);
 },{passive:false});
-$('zoom-in').addEventListener('click',() => changeZoom(zoom*2));
-$('zoom-out').addEventListener('click',() => changeZoom(zoom/2));
 $('dock-toggle').addEventListener('click',() => {
   const body = $('dock-body'), toggle = $('dock-toggle');
   body.hidden = !body.hidden;
