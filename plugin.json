@@ -12,6 +12,7 @@
   "visual": {
     "title": "bughound",
     "place": "drawer",
+    "position": "bottom",
     "entry": "assets/panel.html",
     "files": ["assets/panel.html", "assets/panel.js", "assets/panel.css"]
   }
