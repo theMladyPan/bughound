@@ -1,0 +1,20 @@
+{
+  "intervalMs": 2000,
+  "debounceMs": 500,
+  "timeoutS": 60,
+  "fullOnConfigChange": true,
+  "maxHops": 2,
+  "suites": {
+    "my-workspace": [
+      {
+        "name": "custom tests",
+        "preset": "command",
+        "testGlobs": ["tests/**/*.test.ts"],
+        "watchGlobs": ["src/**"],
+        "run": "pytest tests/test_mod.py::TestExample",
+        "fullRun": "pytest tests/test_mod.py",
+        "configFiles": ["pyproject.toml"]
+      }
+    ]
+  }
+}

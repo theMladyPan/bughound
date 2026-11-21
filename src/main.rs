@@ -9,21 +9,24 @@
 //! What it does: it asks the daemon which workspaces it knows (`workspace.list` hands back each one's
 //! folder, which is the only way this plugin learns one), polls those folders for changes with pruned
 //! recursive metadata snapshots, resolves each changed file to the test files covering it by scanning
-//! Python imports, and runs `pytest` on just those. A panel asks it how the watch is going through the
+//! the suite's import graph (pytest and node presets) or matching test bodies (custom command
+//! suites), and runs just those test files. A panel asks it how the watch is going through the
 //! daemon's fixed method `visual.request`, which this plugin answers from shared state rather than by
 //! doing work: the watcher and the test runner are background threads, so a request is answered in
 //! microseconds even while a run is in flight.
 //!
 //! Configuration arrives as registration `args`, the only way a plugin is told anything: `--interval-ms`
-//! (default 2000), `--debounce-ms` (default 500), `--timeout-s` (default 60), `--workspace` (repeatable,
-//! an id, a name or a folder; the default watches every non-scratch workspace), `--pytest` (the program
-//! to run; otherwise `.venv/bin/pytest`, a venv's `python -m pytest`, or `pytest` on PATH),
-//! `--pytest-arg` (repeatable fixed flags), `--node`, `--tsc`, and `--watch` (repeatable; `python` or
-//! `javascript`, the side to switch on for the folders this plugin watches).
+//! (default 2000), `--debounce-ms` (default 500), `--timeout-s` (default 60), `--max-hops` (default 2),
+//! `--workspace` (repeatable, an id, a name or a folder; the default watches every non-scratch
+//! workspace), `--pytest` (the program to run; otherwise `.venv/bin/pytest`, a venv's `python -m
+//! pytest`, or `pytest` on PATH), `--pytest-arg` (repeatable fixed flags), `--node`, `--tsc`, and
+//! `--watch` (repeatable; `python` or `javascript`, the preset suite to switch on for the folders
+//! this plugin watches).
 //!
-//! What a folder is watched for is the panel's choice, one pair of switches per folder, both off to
-//! begin with: a folder nobody switched anything on for is never walked, spawns nothing, and posts no
-//! card. The type check rides with the JavaScript side.
+//! What a folder is watched for is the panel's suite editor, one list of suites per folder, empty to
+//! begin with: a folder with no suite configured is never walked, spawns nothing, and posts no card.
+//! The type check rides with the node preset suite. Suites are also editable by hand in the settings
+//! file (`bughound.json` beside the board); see README.md and `examples/` for the shape.
 //!
 //! The methods a daemon answers are documented at the top of `server/plugins/service.ts`.
 
@@ -50,9 +53,7 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
-/// How far the test search walks from a changed file through the import graph before it gives up.
-const MAX_HOPS: usize = 16;
-/// The most a run's output keeps in memory, first and last together. More than that is truncated.
+/** The most a run's output keeps in memory, first and last together. More than that is truncated. */
 const OUTPUT_CAP: usize = 64 * 1024;
 
 // ---------- the wire ----------
@@ -522,11 +523,11 @@ impl<T: Transport> Bughound<T> {
                 Ok(queue_manual_run(&self.shared, scope, workspace))
             }
             "set_config" => self.set_config(&inner),
-            "set_watch" => self.set_watch(&inner, workspace),
+            "set_suites" => self.set_suites(&inner, workspace),
             other => Err(RpcError::new(
                 METHOD_NOT_FOUND,
                 &format!(
-                    "{other} is not something this panel asks for; it asks for state, log, toggle_pause, run, set_config and set_watch"
+                    "{other} is not something this panel asks for; it asks for state, log, toggle_pause, run, set_config and set_suites"
                 ),
             )),
         }
@@ -540,10 +541,16 @@ impl<T: Transport> Bughound<T> {
         let debounce = inner.get("debounceMs").and_then(Value::as_u64);
         let timeout = inner.get("timeoutS").and_then(Value::as_u64);
         let full_on_config_change = inner.get("fullOnConfigChange").and_then(Value::as_bool);
-        if interval.is_none() && debounce.is_none() && timeout.is_none() && full_on_config_change.is_none() {
+        let max_hops = inner.get("maxHops").and_then(Value::as_u64);
+        if interval.is_none()
+            && debounce.is_none()
+            && timeout.is_none()
+            && full_on_config_change.is_none()
+            && max_hops.is_none()
+        {
             return Err(RpcError::new(
                 INVALID_PARAMS,
-                "set_config asks for intervalMs, debounceMs, timeoutS or fullOnConfigChange",
+                "set_config asks for intervalMs, debounceMs, timeoutS, fullOnConfigChange or maxHops",
             ));
         }
         let (lock, _) = &*self.shared;
@@ -560,6 +567,9 @@ impl<T: Transport> Bughound<T> {
         if let Some(value) = full_on_config_change {
             shared.config.full_on_config_change = value;
         }
+        if let Some(value) = max_hops {
+            shared.config.max_hops = (value as usize).max(1);
+        }
         let saved = Settings::from_config(&shared.config);
         if let Err(error) = saved.write(&self.settings_path) {
             eprintln!("bughound: the settings could not be written: {error}");
@@ -570,19 +580,31 @@ impl<T: Transport> Bughound<T> {
         Ok(json!({ "ok": true, "settings": settings_view(&self.shared) }))
     }
 
-    /// What one folder is watched for, as the panel's own switches set it. Switching a side off stops
-    /// its scans and runs; switching one on re-reads the folder from scratch, because the files it now
-    /// cares about were never in the snapshot.
-    fn set_watch(&mut self, inner: &Value, workspace: &str) -> Result<Value, RpcError> {
-        let python = inner.get("python").and_then(Value::as_bool);
-        let javascript = inner.get("javascript").and_then(Value::as_bool);
-        if python.is_none() && javascript.is_none() {
-            return Err(RpcError::new(INVALID_PARAMS, "set_watch asks for python, javascript or both"));
+    /// What suites one folder is watched for, as the panel's own editor set them. Removing the last
+    /// suite stops its scans and runs; adding one re-reads the folder from scratch, because the files
+    /// it now cares about were never in the snapshot. Name, preset, globs and templates are saved
+    /// exactly as typed; an entry without a usable preset is refused rather than half saved.
+    fn set_suites(&mut self, inner: &Value, workspace: &str) -> Result<Value, RpcError> {
+        let raw = inner.get("suites").and_then(Value::as_array);
+        let Some(raw) = raw else {
+            return Err(RpcError::new(INVALID_PARAMS, "set_suites asks for suites"));
+        };
+        let mut suites: Vec<Suite> = Vec::new();
+        for entry in raw {
+            match Suite::read(entry) {
+                Some(suite) => suites.push(suite),
+                None => {
+                    return Err(RpcError::new(
+                        INVALID_PARAMS,
+                        "a suite's preset must be pytest, node or command",
+                    ))
+                }
+            }
         }
         if workspace.is_empty() {
-            return Err(RpcError::new(INVALID_PARAMS, "set_watch is asked for one workspace"));
+            return Err(RpcError::new(INVALID_PARAMS, "set_suites is asked for one workspace"));
         }
-        let watch = {
+        let saved_view = {
             let (lock, _) = &*self.shared;
             let mut shared = lock.lock().unwrap();
             let workspace_id = shared
@@ -596,16 +618,18 @@ impl<T: Transport> Bughound<T> {
                 .values()
                 .any(|tracker| tracker.workspace_id == workspace_id)
             {
-                return Err(RpcError::new(INVALID_PARAMS, "this plugin does not know that workspace"));
+                return Err(RpcError::new(
+                    INVALID_PARAMS,
+                    "this plugin does not know that workspace",
+                ));
             }
-            let entry = shared.config.watch.entry(workspace_id.clone()).or_default();
-            if let Some(value) = python {
-                entry.python = value;
+            if suites.is_empty() {
+                // Keep the key: an empty list is what the panel set, and `--watch` defaults only
+                // seed folders nobody has spoken for.
+                shared.config.suites.insert(workspace_id.clone(), Vec::new());
+            } else {
+                shared.config.suites.insert(workspace_id.clone(), suites.clone());
             }
-            if let Some(value) = javascript {
-                entry.javascript = value;
-            }
-            let watch = *entry;
             let saved = Settings::from_config(&shared.config);
             if let Err(error) = saved.write(&self.settings_path) {
                 eprintln!("bughound: the settings could not be written: {error}");
@@ -616,19 +640,27 @@ impl<T: Transport> Bughound<T> {
                 .values_mut()
                 .filter(|tracker| tracker.workspace_id == workspace_id)
             {
-                // The next scan is a baseline again: a side just switched on has files no scan saw.
+                // The next scan is a baseline again: a suite just added has files no scan saw.
                 tracker.initialized = false;
                 tracker.snapshot.clear();
                 tracker.pending.clear();
                 tracker.last_change = None;
-                tracker.phase = if watch.any() { "idle".to_string() } else { "off".to_string() };
-                tracker.message = if watch.any() { String::new() } else { NOTHING_ON.to_string() };
+                tracker.phase = if suites.is_empty() {
+                    "off".to_string()
+                } else {
+                    "idle".to_string()
+                };
+                tracker.message = if suites.is_empty() {
+                    NOTHING_ON.to_string()
+                } else {
+                    String::new()
+                };
                 set_timeline_kind(tracker, "idle", now_ms());
             }
-            watch
+            suites
         };
         wake(&self.shared);
-        Ok(json!({ "ok": true, "watch": watch.view(), "settings": settings_view(&self.shared) }))
+        Ok(json!({ "ok": true, "suites": saved_view.iter().map(Suite::view).collect::<Vec<_>>(), "settings": settings_view(&self.shared) }))
     }
 
     fn send(&mut self, message: Value) -> io::Result<()> {
@@ -842,9 +874,13 @@ fn insert_workspace_trackers(
     worktrees: &[WorktreeInfo],
     watched: bool,
 ) {
-    let defaults = shared.config.watch_defaults;
-    if defaults.any() {
-        shared.config.watch.entry(workspace_id.to_string()).or_insert(defaults);
+    let defaults = shared.config.watch_defaults.clone();
+    if !defaults.is_empty() {
+        shared
+            .config
+            .suites
+            .entry(workspace_id.to_string())
+            .or_insert(defaults);
     }
     for info in worktrees {
         let key = worktree_track_id(workspace_id, info);
@@ -863,7 +899,7 @@ fn insert_workspace_trackers(
             info.is_root,
             card_key,
         );
-        if !watch_of(shared, &key).any() {
+        if suites_of(shared, &key).is_empty() {
             tracker.phase = "off".to_string();
             tracker.message = NOTHING_ON.to_string();
             tracker.timeline_kind = Some("idle".to_string());
@@ -982,14 +1018,19 @@ fn knows(shared: &Arc<(Mutex<Shared>, Condvar)>, workspace: &str) -> bool {
             .any(|tracker| tracker.workspace_id == workspace)
 }
 
-/// What one folder is watched for. A folder the panel has not spoken for is watched for nothing.
-fn watch_of(shared: &Shared, workspace: &str) -> Watch {
+/// What suites a folder is watched for, as the panel set them. A folder the panel has not spoken for
+/// is watched for nothing. `--watch` defaults only seed folders nobody has spoken for: deleting
+/// every suite in the panel leaves an empty list on purpose, and the defaults do not come back.
+fn suites_of(shared: &Shared, workspace: &str) -> Vec<Suite> {
     let workspace_id = shared
         .workspaces
         .get(workspace)
         .map(|tracker| tracker.workspace_id.as_str())
         .unwrap_or_else(|| workspace.split(':').next().unwrap_or(workspace));
-    shared.config.watch.get(workspace_id).copied().unwrap_or_default()
+    match shared.config.suites.get(workspace_id) {
+        Some(suites) => suites.clone(),
+        None => shared.config.watch_defaults.clone(),
+    }
 }
 
 // ---------- configuration ----------
@@ -1000,66 +1041,301 @@ struct Config {
     debounce_ms: u64,
     timeout_s: u64,
     full_on_config_change: bool,
+    /// How many reverse-import hops past the changed file a change may travel (1 = the changed file
+    /// itself only, 2 = it and its direct importers). Stops the walk before a core file pulls the
+    /// whole suite into one run: running half the tests on every keystroke is the opposite of the
+    /// help this plugin exists to give.
+    max_hops: usize,
     workspaces: Vec<String>,
     pytest: Option<String>,
     pytest_args: Vec<String>,
     node: Option<String>,
     tsc: Option<String>,
-    /// What each folder is watched for, by workspace id. A folder that is not in here is watched for
-    /// nothing at all: no scan, no run, no card. The type check rides with the JavaScript side.
-    watch: BTreeMap<String, Watch>,
-    /// The sides a `--watch` arg named: those are switched on for every folder this plugin watches,
+    /// The test suites each folder is watched for, by workspace id. A folder that is not in here is
+    /// watched for nothing at all: no scan, no run, no card. The type check rides with the node
+    /// suite when one configures `tsconfig.json`.
+    suites: BTreeMap<String, Vec<Suite>>,
+    /// The suites a `--watch` arg named: those are switched on for every folder this plugin watches,
     /// wherever the panel has not said otherwise. Without an arg, and without the panel, nothing is.
-    watch_defaults: Watch,
+    watch_defaults: Vec<Suite>,
 }
 
-/// What a folder's phase and its panel line say while nothing is switched on for it.
-const NOTHING_ON: &str = "nothing is switched on for this folder";
+/// What a folder's phase and its panel line say while nothing is configured for it.
+const NOTHING_ON: &str = "no test suite is configured for this folder";
 
-/// The two things bughound can do for a folder, both off until the panel switches one on.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Watch {
-    python: bool,
-    javascript: bool,
+/// One test suite a folder is watched for. A suite is a language preset or a custom command: the
+/// preset brings its own file patterns, config files and import rules, the command forms bring the
+/// user's own templates. Templates carry `{targets}`, replaced by the resolved test files; without
+/// it, the resolved files are appended. No template is still the preset's built-in runner, so the
+/// two switches that used to be the whole model are now just the two preset suites.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Suite {
+    name: String,
+    preset: String,
+    test_globs: Vec<String>,
+    watch_globs: Vec<String>,
+    run: String,
+    full_run: String,
+    config_files: Vec<String>,
 }
 
-impl Watch {
-    fn any(&self) -> bool {
-        self.python || self.javascript
-    }
-
-    /// This watch with one more side switched on, named the way a `--watch` arg names it.
-    fn plus(self, side: &str, flag: &str) -> Result<Watch, String> {
-        match side {
-            "python" => Ok(Watch {
-                python: true,
-                ..self
-            }),
-            "javascript" | "node" => Ok(Watch {
-                javascript: true,
-                ..self
-            }),
-            other => Err(format!("{flag} names python or javascript, not {other}")),
+impl Suite {
+    fn new(name: &str, preset: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            preset: preset.to_string(),
+            test_globs: Vec::new(),
+            watch_globs: Vec::new(),
+            run: String::new(),
+            full_run: String::new(),
+            config_files: Vec::new(),
         }
     }
 
-    /// The files this setting makes worth watching: the sources of a switched-on side, and the
-    /// configuration files its tools read, whose change is a whole-suite run.
-    fn wants(&self, name: &str) -> bool {
-        (self.python && (name.ends_with(".py") || matches!(name, "pyproject.toml" | "pytest.ini" | "tox.ini" | "setup.cfg")))
-            || (self.javascript && (has_jsts_extension(name) || matches!(name, "tsconfig.json" | "package.json")))
+    fn is_pytest(&self) -> bool {
+        self.preset == "pytest"
     }
 
-    fn read(value: &Value) -> Watch {
-        Watch {
-            python: value.get("python").and_then(Value::as_bool).unwrap_or(false),
-            javascript: value.get("javascript").and_then(Value::as_bool).unwrap_or(false),
+    fn is_node(&self) -> bool {
+        self.preset == "node"
+    }
+
+    fn is_command(&self) -> bool {
+        self.preset == "command"
+    }
+
+    /// The config files whose change means a whole-suite run, preset defaults when the user wrote
+    /// none. The custom preset has none: it says what its runner reads, or it says nothing.
+    fn config_names(&self) -> Vec<String> {
+        if !self.config_files.is_empty() {
+            return self.config_files.clone();
         }
+        match self.preset.as_str() {
+            "pytest" => ["pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg"]
+                .iter()
+                .map(|one| one.to_string())
+                .collect(),
+            "node" => ["tsconfig.json", "package.json"].iter().map(|one| one.to_string()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The files this suite makes worth watching. A command suite with no watch globs watches
+    /// everything not pruned; with globs, only what they match.
+    fn wants(&self, name: &str, rel: &Path) -> bool {
+        match self.preset.as_str() {
+            "pytest" => {
+                name.ends_with(".py") || self.config_names().iter().any(|one| one == name)
+            }
+            "node" => {
+                has_jsts_extension(name) || self.config_names().iter().any(|one| one == name)
+            }
+            "command" => {
+                if self.watch_globs.is_empty() {
+                    return true;
+                }
+                let rel_text = rel_text(rel);
+                self.watch_globs
+                    .iter()
+                    .any(|pattern| glob_match(pattern, &rel_text))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this relative path is a test file under this suite. User globs win; otherwise the
+    /// preset's own pattern.
+    fn is_test(&self, rel: &Path) -> bool {
+        let rel_text = rel_text(rel);
+        if !self.test_globs.is_empty() {
+            return self
+                .test_globs
+                .iter()
+                .any(|pattern| glob_match(pattern, &rel_text));
+        }
+        match self.preset.as_str() {
+            "pytest" => is_test_file(rel),
+            "node" => is_jsts_test_file(rel),
+            _ => false,
+        }
+    }
+
+    fn read(value: &Value) -> Option<Suite> {
+        let value = value.as_object()?;
+        let preset = value.get("preset").and_then(Value::as_str).unwrap_or("command");
+        if !matches!(preset, "pytest" | "node" | "command") {
+            return None;
+        }
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|one| !one.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| preset.to_string());
+        let list = |key: &str| -> Vec<String> {
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let text = |key: &str| -> String {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        Some(Suite {
+            name,
+            preset: preset.to_string(),
+            test_globs: list("testGlobs"),
+            watch_globs: list("watchGlobs"),
+            run: text("run"),
+            full_run: text("fullRun"),
+            config_files: list("configFiles"),
+        })
     }
 
     fn view(&self) -> Value {
-        json!({ "python": self.python, "javascript": self.javascript })
+        json!({
+            "name": self.name,
+            "preset": self.preset,
+            "testGlobs": self.test_globs,
+            "watchGlobs": self.watch_globs,
+            "run": self.run,
+            "fullRun": self.full_run,
+            "configFiles": self.config_files,
+        })
     }
+}
+
+/// A relative path as the globs match it: forward slashes, no leading `./`.
+fn rel_text(rel: &Path) -> String {
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Segment-wise glob match, the small subset the suite settings use: `*` and `?` inside a segment,
+/// `**` spanning segments. A pattern with no `/` matches the file name at any depth; one with `/`
+/// matches from the folder root. No character classes, no braces: enough to say `test_*.py` or
+/// `tests/**/*.test.ts`, and small enough to read as one function.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    if !pattern.contains('/') {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        return segment_match(pattern, name);
+    }
+    let pats: Vec<&str> = pattern.split('/').collect();
+    let segs: Vec<&str> = path.split('/').collect();
+    match_segments(&pats, &segs)
+}
+
+fn match_segments(pats: &[&str], segs: &[&str]) -> bool {
+    if pats.is_empty() {
+        return segs.is_empty();
+    }
+    if pats[0] == "**" {
+        for i in 0..=segs.len() {
+            if match_segments(&pats[1..], &segs[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if segs.is_empty() {
+        return false;
+    }
+    segment_match(pats[0], segs[0]) && match_segments(&pats[1..], &segs[1..])
+}
+
+fn segment_match(pattern: &str, text: &str) -> bool {
+    // Classic two-pointer wildcard match. A `*` is retried from one position later each time it
+    // fails, so the search swallows at most the text it has to and always terminates.
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let mut star_pat: Option<usize> = None;
+    let mut star_txt = 0;
+    while ti < txt.len() {
+        if pi < pat.len() && (pat[pi] == txt[ti] || pat[pi] == '?') {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            while pi < pat.len() && pat[pi] == '*' {
+                pi += 1;
+            }
+            if pi == pat.len() {
+                return true;
+            }
+            star_pat = Some(pi);
+            star_txt = ti;
+        } else if let Some(restart) = star_pat {
+            pi = restart;
+            star_txt += 1;
+            ti = star_txt;
+        } else {
+            return false;
+        }
+    }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+/// One run template expanded to argv: whitespace separated, single and double quotes group one
+/// argument, `{targets}` becomes the resolved files (one argument each). A template with no
+/// `{targets}` gets the targets appended, so `pytest` alone still targets the resolved files.
+/// Never a shell: the command is an explicit argv, as every other run in this file is.
+fn expand_template(template: &str, targets: &[PathBuf]) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut saw_targets = false;
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            } else {
+                cur.push(c);
+            }
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+        } else if c.is_whitespace() {
+            if !cur.is_empty() {
+                if cur == "{targets}" {
+                    argv.extend(targets.iter().map(|one| one.to_string_lossy().into_owned()));
+                    saw_targets = true;
+                } else {
+                    argv.push(cur.clone());
+                }
+                cur.clear();
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        if cur == "{targets}" {
+            argv.extend(targets.iter().map(|one| one.to_string_lossy().into_owned()));
+            saw_targets = true;
+        } else {
+            argv.push(cur);
+        }
+    }
+    if !saw_targets && !targets.is_empty() {
+        argv.extend(targets.iter().map(|one| one.to_string_lossy().into_owned()));
+    }
+    argv
 }
 
 impl Config {
@@ -1068,6 +1344,7 @@ impl Config {
             interval_ms: 2000,
             debounce_ms: 500,
             timeout_s: 60,
+            max_hops: 2,
             ..Config::default()
         }
     }
@@ -1086,7 +1363,8 @@ struct Given {
     node: Option<String>,
     tsc: Option<String>,
     settings_path: Option<String>,
-    watch_defaults: Watch,
+    max_hops: Option<usize>,
+    watch_defaults: Vec<Suite>,
 }
 
 /// The timings the panel's settings page last wrote, and what it switched the watch on for, if it
@@ -1097,7 +1375,8 @@ struct Settings {
     debounce_ms: Option<u64>,
     timeout_s: Option<u64>,
     full_on_config_change: Option<bool>,
-    watch: BTreeMap<String, Watch>,
+    max_hops: Option<usize>,
+    suites: BTreeMap<String, Vec<Suite>>,
 }
 
 impl Settings {
@@ -1108,16 +1387,48 @@ impl Settings {
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
             return Settings::default();
         };
+        let suites: BTreeMap<String, Vec<Suite>> = value
+            .get("suites")
+            .and_then(Value::as_object)
+            .map(|rows| {
+                rows.iter()
+                    .map(|(id, one)| {
+                        let parsed: Vec<Suite> = one
+                            .as_array()
+                            .map(|items| items.iter().filter_map(Suite::read).collect())
+                            .unwrap_or_default();
+                        (id.clone(), parsed)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The two-switch shape this plugin used to write: a folder switched on for a side opens
+        // with that preset suite, so an existing install keeps its watch instead of starting over.
+        // Written files no longer carry the old shape.
+        let mut suites = suites;
+        if let Some(legacy) = value.get("watch").and_then(Value::as_object) {
+            for (id, one) in legacy {
+                suites.entry(id.clone()).or_default();
+                let entry = suites.get_mut(id).unwrap();
+                if one.get("python").and_then(Value::as_bool).unwrap_or(false)
+                    && !entry.iter().any(|suite| suite.preset == "pytest")
+                {
+                    entry.push(Suite::new("python tests", "pytest"));
+                }
+                if one.get("javascript").and_then(Value::as_bool).unwrap_or(false)
+                    && !entry.iter().any(|suite| suite.preset == "node")
+                {
+                    entry.push(Suite::new("javascript tests", "node"));
+                }
+            }
+        }
         Settings {
             interval_ms: value.get("intervalMs").and_then(Value::as_u64),
             debounce_ms: value.get("debounceMs").and_then(Value::as_u64),
             timeout_s: value.get("timeoutS").and_then(Value::as_u64),
             full_on_config_change: value.get("fullOnConfigChange").and_then(Value::as_bool),
-            watch: value
-                .get("watch")
-                .and_then(Value::as_object)
-                .map(|rows| rows.iter().map(|(id, one)| (id.clone(), Watch::read(one))).collect())
-                .unwrap_or_default(),
+            max_hops: value.get("maxHops").and_then(Value::as_u64).map(|one| one as usize),
+            suites,
         }
     }
 
@@ -1125,17 +1436,23 @@ impl Settings {
         if let Some(folder) = path.parent() {
             std::fs::create_dir_all(folder)?;
         }
-        let watch: serde_json::Map<String, Value> = self
-            .watch
+        let suites: serde_json::Map<String, Value> = self
+            .suites
             .iter()
-            .map(|(id, one)| (id.clone(), one.view()))
+            .map(|(id, rows)| {
+                (
+                    id.clone(),
+                    Value::Array(rows.iter().map(Suite::view).collect()),
+                )
+            })
             .collect();
         let text = json!({
             "intervalMs": self.interval_ms,
             "debounceMs": self.debounce_ms,
             "timeoutS": self.timeout_s,
             "fullOnConfigChange": self.full_on_config_change.unwrap_or(false),
-            "watch": watch,
+            "maxHops": self.max_hops.unwrap_or(2),
+            "suites": suites,
         });
         std::fs::write(path, format!("{}\n", text))
     }
@@ -1147,7 +1464,8 @@ impl Settings {
             debounce_ms: Some(config.debounce_ms),
             timeout_s: Some(config.timeout_s),
             full_on_config_change: Some(config.full_on_config_change),
-            watch: config.watch.clone(),
+            max_hops: Some(config.max_hops),
+            suites: config.suites.clone(),
         }
     }
 }
@@ -1214,8 +1532,19 @@ fn parse_given(args: &[String]) -> Result<Given, String> {
             "--tsc" => {
                 given.tsc = Some(value(&mut i)?);
             }
+            "--max-hops" => {
+                given.max_hops = Some(parse_u64(&value(&mut i)?, flag)?.max(1) as usize);
+            }
             "--watch" => {
-                given.watch_defaults = given.watch_defaults.plus(&value(&mut i)?, flag)?;
+                let side = value(&mut i)?;
+                let suite = match side.as_str() {
+                    "python" => Suite::new("python tests", "pytest"),
+                    "javascript" | "node" => Suite::new("javascript tests", "node"),
+                    other => return Err(format!("{flag} names python or javascript, not {other}")),
+                };
+                if !given.watch_defaults.iter().any(|one| one == &suite) {
+                    given.watch_defaults.push(suite);
+                }
             }
             _ => return Err(format!("unknown argument {flag}")),
         }
@@ -1240,7 +1569,10 @@ fn resolve(given: Given, saved: Option<Settings>) -> Result<Config, String> {
         if let Some(value) = saved.full_on_config_change {
             config.full_on_config_change = value;
         }
-        config.watch = saved.watch;
+        if let Some(value) = saved.max_hops {
+            config.max_hops = value.max(1);
+        }
+        config.suites = saved.suites;
     }
     if let Some(value) = given.interval_ms {
         config.interval_ms = value;
@@ -1250,6 +1582,9 @@ fn resolve(given: Given, saved: Option<Settings>) -> Result<Config, String> {
     }
     if let Some(value) = given.timeout_s {
         config.timeout_s = value;
+    }
+    if let Some(value) = given.max_hops {
+        config.max_hops = value.max(1);
     }
     config.workspaces = given.workspaces;
     config.pytest = given.pytest;
@@ -1388,6 +1723,11 @@ struct Job {
     js_targets: Vec<PathBuf>,
     js_full: bool,
     js_typecheck: bool,
+    /// Empty: the preset runners build argv themselves. Set: the user's own argv, expanded from
+    /// this template over the resolved targets (or the suite's full-run template when full).
+    py_template: String,
+    js_template: String,
+    custom: Vec<CustomRun>,
     reason: String,
 }
 
@@ -1523,6 +1863,13 @@ fn timeline_failures_json(tracker: &WorkspaceTracker, now: u64, include_logs: bo
         .collect()
 }
 
+struct CustomRun {
+    name: String,
+    template: String,
+    full: bool,
+    targets: Vec<PathBuf>,
+}
+
 /// One manual or watched run, queued if its workspace has no run waiting already.
 fn push_job(hub: &Hub, job: Job) {
     {
@@ -1561,7 +1908,36 @@ fn merge_into(waiting: &mut Job, job: Job) {
         }
     }
     waiting.js_typecheck = waiting.js_typecheck || job.js_typecheck;
+    // A full upgrade replaces the template: a targeted template (`pytest {targets} -k unit`) must
+    // never ride a whole-suite run with its filter still on it.
+    if job.full {
+        waiting.py_template = job.py_template.clone();
+    } else if waiting.py_template.is_empty() {
+        waiting.py_template = job.py_template;
+    }
+    if job.js_full {
+        waiting.js_template = job.js_template.clone();
+    } else if waiting.js_template.is_empty() {
+        waiting.js_template = job.js_template;
+    }
     waiting.reason = job.reason;
+    for run in job.custom {
+        if let Some(existing) = waiting.custom.iter_mut().find(|one| one.name == run.name) {
+            if run.full {
+                existing.full = true;
+                existing.template = run.template.clone();
+                existing.targets.clear();
+            } else if !existing.full {
+                for target in run.targets {
+                    if !existing.targets.contains(&target) {
+                        existing.targets.push(target);
+                    }
+                }
+            }
+        } else {
+            waiting.custom.push(run);
+        }
+    }
 }
 
 // ---------- the coordinator: scan, debounce, resolve, dispatch ----------
@@ -1603,20 +1979,20 @@ fn coordinator(hub: Hub) {
         for (workspace_id, folder, workspace_name) in roots {
             refresh_workspace_worktrees(&hub, workspace_id, folder, workspace_name);
         }
-        // Snapshot the folders without the lock in hand: a walk is the slow part. Only a folder the
-        // panel switched something on for is walked; the rest cost one check per scan.
-        let watched: Vec<(String, PathBuf, Watch)> = {
+        // Snapshot the folders without the lock in hand: a walk is the slow part. Only a folder with
+        // a configured suite is walked; the rest cost one check per scan.
+        let watched: Vec<(String, PathBuf, Vec<Suite>)> = {
             let (lock, _) = &*hub;
             let shared = lock.lock().unwrap();
             shared
                 .workspaces
                 .values()
                 .filter(|one| one.watched)
-                .map(|one| (one.id.clone(), one.folder.clone(), watch_of(&shared, &one.id)))
+                .map(|one| (one.id.clone(), one.folder.clone(), suites_of(&shared, &one.id)))
                 .collect()
         };
-        for (id, folder, watch) in watched {
-            if !watch.any() {
+        for (id, folder, suites) in watched {
+            if suites.is_empty() {
                 let (lock, _) = &*hub;
                 let mut shared = lock.lock().unwrap();
                 if let Some(tracker) = shared.workspaces.get_mut(&id) {
@@ -1629,7 +2005,7 @@ fn coordinator(hub: Hub) {
                 continue;
             }
             let scan_started_at = now_ms();
-            let snapshot = scan(&folder, watch);
+            let snapshot = scan(&folder, &suites);
             let pending: Vec<PathBuf> = {
                 let (lock, _) = &*hub;
                 let mut shared = lock.lock().unwrap();
@@ -1664,7 +2040,7 @@ fn coordinator(hub: Hub) {
                 continue;
             }
             // A pause holds the run, not the watch: the pending set stays for the resume.
-            let (debounced, paused, busy, full_on_config_change) = {
+            let (debounced, paused, busy, full_on_config_change, max_hops) = {
                 let (lock, _) = &*hub;
                 let shared = lock.lock().unwrap();
                 let tracker = &shared.workspaces[&id];
@@ -1677,24 +2053,29 @@ fn coordinator(hub: Hub) {
                     shared.paused,
                     tracker.running.is_some(),
                     shared.config.full_on_config_change,
+                    shared.config.max_hops.max(1),
                 )
             };
             if !debounced || paused || busy {
                 continue;
             }
-            // Resolve without the lock: reading every file is the slow part. The Python and the
-            // JavaScript sides resolve independently, and only the side the panel switched on is read.
-            let resolution = if watch.python {
-                resolve_targets(&folder, &pending.iter().cloned().collect(), full_on_config_change)
-            } else {
-                Resolution::NoTests
-            };
-            let js_resolution = if watch.javascript {
-                resolve_jsts(&folder, &pending.iter().cloned().collect(), full_on_config_change)
-            } else {
-                Resolution::NoTests
-            };
-            let no_tests = matches!(resolution, Resolution::NoTests) && matches!(js_resolution, Resolution::NoTests);
+            // Resolve without the lock: reading every file is the slow part. Each configured suite
+            // resolves on its own; only what the panel set is read.
+            let changed_set: BTreeSet<PathBuf> = pending.iter().cloned().collect();
+            let mut resolved: Vec<(Suite, Resolution)> = Vec::new();
+            for suite in &suites {
+                let resolution = if suite.is_pytest() {
+                    resolve_targets(&folder, &changed_set, full_on_config_change, suite, max_hops)
+                } else if suite.is_node() {
+                    resolve_jsts(&folder, &changed_set, full_on_config_change, suite, max_hops)
+                } else {
+                    resolve_custom(&folder, &changed_set, full_on_config_change, suite)
+                };
+                resolved.push((suite.clone(), resolution));
+            }
+            let no_tests = resolved
+                .iter()
+                .all(|(_, resolution)| matches!(resolution, Resolution::NoTests));
             let dispatched = {
                 let (lock, _) = &*hub;
                 let mut shared = lock.lock().unwrap();
@@ -1722,39 +2103,103 @@ fn coordinator(hub: Hub) {
                     js_targets: vec![],
                     js_full: false,
                     js_typecheck: false,
+                    py_template: String::new(),
+                    js_template: String::new(),
+                    custom: vec![],
                     reason: String::new(),
                 };
-                match resolution {
-                    Resolution::Full => {
-                        tracker.message = "suite configuration changed: running everything".to_string();
-                        job.full = true;
-                        job.reason = "config changed".to_string();
-                    }
-                    Resolution::Targets(targets) => {
-                        tracker.message = format!("{} test file(s) cover the change", targets.len());
-                        job.targets = targets;
-                        job.reason = "files changed".to_string();
-                    }
-                    Resolution::NoTests => {}
-                }
-                // A type check runs with every affected-test run, because a type error is the break
-                // the user meets first; a config change turns it into a whole-suite run with the tests.
-                match js_resolution {
-                    Resolution::Full => {
-                        job.js_full = true;
-                        job.js_typecheck = has_tsc;
-                        job.reason = "config changed".to_string();
-                    }
-                    Resolution::Targets(targets) => {
-                        job.js_targets = targets;
-                        job.js_typecheck = has_tsc;
-                        if job.reason.is_empty() {
-                            job.reason = "files changed".to_string();
+                let mut covered = 0;
+                let mut changed_config = false;
+                for (suite, resolution) in resolved {
+                    if suite.is_pytest() {
+                        match resolution {
+                            Resolution::Full => {
+                                changed_config = true;
+                                job.full = true;
+                                if !suite.full_run.is_empty() {
+                                    job.py_template = suite.full_run.clone();
+                                } else if !suite.run.is_empty() {
+                                    job.py_template = suite.run.clone();
+                                }
+                            }
+                            Resolution::Targets(targets) => {
+                                covered += targets.len();
+                                job.targets.extend(targets);
+                                if !suite.run.is_empty() {
+                                    job.py_template = suite.run.clone();
+                                }
+                            }
+                            Resolution::NoTests => {}
+                        }
+                    } else if suite.is_node() {
+                        match resolution {
+                            Resolution::Full => {
+                                changed_config = true;
+                                job.js_full = true;
+                                job.js_typecheck = has_tsc;
+                                if !suite.full_run.is_empty() {
+                                    job.js_template = suite.full_run.clone();
+                                } else if !suite.run.is_empty() {
+                                    job.js_template = suite.run.clone();
+                                }
+                            }
+                            Resolution::Targets(targets) => {
+                                covered += targets.len();
+                                job.js_targets.extend(targets);
+                                job.js_typecheck = has_tsc;
+                                if !suite.run.is_empty() {
+                                    job.js_template = suite.run.clone();
+                                }
+                            }
+                            Resolution::NoTests => {}
+                        }
+                    } else {
+                        match resolution {
+                            Resolution::Full => {
+                                changed_config = true;
+                                job.custom.push(CustomRun {
+                                    name: suite.name.clone(),
+                                    template: if !suite.full_run.is_empty() {
+                                        suite.full_run.clone()
+                                    } else {
+                                        suite.run.clone()
+                                    },
+                                    full: true,
+                                    targets: vec![],
+                                });
+                            }
+                            Resolution::Targets(targets) => {
+                                covered += targets.len();
+                                let name = suite.name.clone();
+                                let template = if !suite.run.is_empty() {
+                                    suite.run.clone()
+                                } else {
+                                    suite.full_run.clone()
+                                };
+                                job.custom.push(CustomRun {
+                                    name,
+                                    template,
+                                    full: false,
+                                    targets,
+                                });
+                            }
+                            Resolution::NoTests => {}
                         }
                     }
-                    Resolution::NoTests => {}
                 }
+                // A custom suite with a full-run template but no mapping input (no test globs) fell
+                // through to Full above, so an unmapped change runs the suite's command.
                 if !no_tests {
+                    tracker.message = if changed_config {
+                        "suite configuration changed: running everything".to_string()
+                    } else {
+                        format!("{} test file(s) cover the change", covered)
+                    };
+                    job.reason = if changed_config {
+                        "config changed".to_string()
+                    } else {
+                        "files changed".to_string()
+                    };
                     push_job_locked(&mut shared, id.clone(), job);
                 } else {
                     tracker.phase = "no_tests".to_string();
@@ -1799,11 +2244,11 @@ const PRUNED: &[&str] = &[
     ".pytest_cache", ".ruff_cache", "__pycache__", "node_modules", "target", "dist", "build", ".eggs",
 ];
 
-/// A snapshot of one folder: every file the panel switched the watch on for, as (mtime seconds, mtime
-/// nanos, length). A folder with nothing switched on is not walked at all.
-fn scan(folder: &Path, watch: Watch) -> HashMap<PathBuf, (u64, u64, u64)> {
+/// A snapshot of one folder: every file a configured suite watches for, as (mtime seconds, mtime
+/// nanos, length). A folder with nothing configured is not walked at all.
+fn scan(folder: &Path, suites: &[Suite]) -> HashMap<PathBuf, (u64, u64, u64)> {
     let mut out = HashMap::new();
-    if !watch.any() {
+    if suites.is_empty() {
         return out;
     }
     let mut stack = vec![folder.to_path_buf()];
@@ -1827,7 +2272,10 @@ fn scan(folder: &Path, watch: Watch) -> HashMap<PathBuf, (u64, u64, u64)> {
                 stack.push(path);
             } else if file_type.is_file() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if !watch.wants(&name) {
+                let Ok(relative) = path.strip_prefix(folder) else {
+                    continue;
+                };
+                if !suites.iter().any(|suite| suite.wants(&name, relative)) {
                     continue;
                 }
                 if let Ok(meta) = entry.metadata() {
@@ -1836,9 +2284,7 @@ fn scan(folder: &Path, watch: Watch) -> HashMap<PathBuf, (u64, u64, u64)> {
                         .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
                         .map(|elapsed| (elapsed.as_secs(), elapsed.subsec_nanos() as u64))
                         .unwrap_or((0, 0));
-                    if let Ok(relative) = path.strip_prefix(folder) {
-                        out.insert(relative.to_path_buf(), (secs, nanos, meta.len()));
-                    }
+                    out.insert(relative.to_path_buf(), (secs, nanos, meta.len()));
                 }
             }
         }
@@ -1880,13 +2326,20 @@ fn is_test_file(path: &Path) -> bool {
     name.ends_with(".py") && (name.starts_with("test_") || name.ends_with("_test.py"))
 }
 
-fn resolve_targets(folder: &Path, changed: &BTreeSet<PathBuf>, full_on_config_change: bool) -> Resolution {
+fn resolve_targets(
+    folder: &Path,
+    changed: &BTreeSet<PathBuf>,
+    full_on_config_change: bool,
+    suite: &Suite,
+    max_hops: usize,
+) -> Resolution {
     let mut targets: BTreeSet<PathBuf> = BTreeSet::new();
     let mut seeds: BTreeSet<PathBuf> = BTreeSet::new();
     let mut full = false;
+    let config_names = suite.config_names();
     for path in changed {
         let name = path.file_name().and_then(|one| one.to_str()).unwrap_or("");
-        if matches!(name, "pyproject.toml" | "pytest.ini" | "tox.ini" | "setup.cfg") {
+        if config_names.iter().any(|one| one == name) {
             full = full_on_config_change;
         } else if name == "conftest.py" {
             match path.parent() {
@@ -1907,14 +2360,14 @@ fn resolve_targets(folder: &Path, changed: &BTreeSet<PathBuf>, full_on_config_ch
         let mut visited: HashSet<PathBuf> = HashSet::new();
         let mut frontier: Vec<PathBuf> = seeds.into_iter().collect();
         let mut hops = 0;
-        while !frontier.is_empty() && hops < MAX_HOPS {
+        while !frontier.is_empty() && hops < max_hops {
             hops += 1;
             let mut next: Vec<PathBuf> = Vec::new();
             for file in frontier {
                 if !visited.insert(file.clone()) {
                     continue;
                 }
-                if is_test_file(&file) {
+                if suite.is_test(&file) {
                     targets.insert(file.clone());
                 }
                 if let Some(importers) = dependents.get(&file) {
@@ -2474,12 +2927,19 @@ fn jsts_dependents_of(folder: &Path) -> HashMap<PathBuf, BTreeSet<PathBuf>> {
 
 /// A change in the JavaScript world to the tests that cover it: the same reading pytest gets, over a
 /// graph parsed from `import`, `export` and `require`.
-fn resolve_jsts(folder: &Path, changed: &BTreeSet<PathBuf>, full_on_config_change: bool) -> Resolution {
+fn resolve_jsts(
+    folder: &Path,
+    changed: &BTreeSet<PathBuf>,
+    full_on_config_change: bool,
+    suite: &Suite,
+    max_hops: usize,
+) -> Resolution {
     let mut targets: BTreeSet<PathBuf> = BTreeSet::new();
     let mut seeds: BTreeSet<PathBuf> = BTreeSet::new();
+    let config_names = suite.config_names();
     for path in changed {
         let name = path.file_name().and_then(|one| one.to_str()).unwrap_or("");
-        if matches!(name, "tsconfig.json" | "package.json") {
+        if config_names.iter().any(|one| one == name) {
             if full_on_config_change {
                 return Resolution::Full;
             }
@@ -2492,14 +2952,14 @@ fn resolve_jsts(folder: &Path, changed: &BTreeSet<PathBuf>, full_on_config_chang
         let mut visited: HashSet<PathBuf> = HashSet::new();
         let mut frontier: Vec<PathBuf> = seeds.into_iter().collect();
         let mut hops = 0;
-        while !frontier.is_empty() && hops < MAX_HOPS {
+        while !frontier.is_empty() && hops < max_hops {
             hops += 1;
             let mut next: Vec<PathBuf> = Vec::new();
             for file in frontier {
                 if !visited.insert(file.clone()) {
                     continue;
                 }
-                if is_jsts_test_file(&file) {
+                if suite.is_test(&file) {
                     targets.insert(file.clone());
                 }
                 if let Some(importers) = dependents.get(&file) {
@@ -2511,6 +2971,116 @@ fn resolve_jsts(folder: &Path, changed: &BTreeSet<PathBuf>, full_on_config_chang
                 }
             }
             frontier = next;
+        }
+    }
+    if targets.is_empty() {
+        Resolution::NoTests
+    } else {
+        Resolution::Targets(targets.into_iter().collect())
+    }
+}
+
+/// Every file under one folder whose relative path matches a suite's test globs: the inventory a
+/// command suite maps through, since it has no import graph of its own.
+fn glob_files(folder: &Path, suite: &Suite) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if suite.test_globs.is_empty() {
+        return out;
+    }
+    let mut stack = vec![folder.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if PRUNED.contains(&name.as_str()) || name.ends_with(".egg-info") {
+                    continue;
+                }
+                stack.push(path);
+            } else if file_type.is_file() {
+                let Ok(relative) = path.strip_prefix(folder) else {
+                    continue;
+                };
+                let text = rel_text(relative);
+                if suite
+                    .test_globs
+                    .iter()
+                    .any(|pattern| glob_match(pattern, &text))
+                {
+                    out.push(relative.to_path_buf());
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The stem a command suite searches test bodies for: the changed file's name without its
+/// extension, so `server/bus.ts` maps to tests that mention `bus`.
+fn file_stem(path: &Path) -> String {
+    path.file_name()
+        .and_then(|one| one.to_str())
+        .unwrap_or("")
+        .rsplit_once('.')
+        .map(|(stem, _)| stem.to_string())
+        .unwrap_or_else(|| path.file_name().and_then(|one| one.to_str()).unwrap_or("").to_string())
+}
+
+/// A change to a custom suite's tests: without an import graph there is no transitivity, so a
+/// changed test runs itself, and a changed source runs the tests that mention its stem. Without
+/// test globs there is nothing to search, and the suite's command runs whole.
+fn resolve_custom(
+    folder: &Path,
+    changed: &BTreeSet<PathBuf>,
+    full_on_config_change: bool,
+    suite: &Suite,
+) -> Resolution {
+    let config_names = suite.config_names();
+    let mut targets: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut seeds: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut full = false;
+    for path in changed {
+        let name = path.file_name().and_then(|one| one.to_str()).unwrap_or("");
+        if config_names.iter().any(|one| one == name) {
+            full = full_on_config_change;
+        } else if suite.is_test(path) {
+            targets.insert(path.clone());
+        } else if suite.wants(name, path) {
+            seeds.insert(path.clone());
+        }
+    }
+    if full {
+        return Resolution::Full;
+    }
+    // Unmapped input (no test globs at all) means no search can run: the whole suite runs.
+    if !seeds.is_empty() && suite.test_globs.is_empty() {
+        return Resolution::Full;
+    }
+    if !seeds.is_empty() {
+        let tests = glob_files(folder, suite);
+        for seed in seeds {
+            let stem = file_stem(&seed);
+            if stem.len() < 2 {
+                continue;
+            }
+            for test in &tests {
+                let Ok(text) = std::fs::read_to_string(folder.join(test)) else {
+                    continue;
+                };
+                if text.contains(&stem) {
+                    targets.insert(test.clone());
+                }
+            }
         }
     }
     if targets.is_empty() {
@@ -2659,20 +3229,26 @@ fn runner(hub: Hub) {
         }
         // A side with no work merges away: a TypeScript-only workspace never spawns pytest, and a
         // Python-only one never asks for tsc or node.
-        let outcome = merge_outcomes(
-            if !job.full && job.targets.is_empty() {
-                Outcome {
-                    status: "no_tests".to_string(),
-                    summary: String::new(),
-                    failures: vec![],
-                    output: String::new(),
-                    duration_ms: 0,
-                }
-            } else {
-                run_pytest(&hub, job.workspace.clone(), &job)
-            },
-            run_jsts(&hub, job.workspace.clone(), &job),
-        );
+        let outcome = {
+            let mut outcome = merge_outcomes(
+                if !job.full && job.targets.is_empty() {
+                    Outcome {
+                        status: "no_tests".to_string(),
+                        summary: String::new(),
+                        failures: vec![],
+                        output: String::new(),
+                        duration_ms: 0,
+                    }
+                } else {
+                    run_pytest(&hub, job.workspace.clone(), &job)
+                },
+                run_jsts(&hub, job.workspace.clone(), &job),
+            );
+            for run in &job.custom {
+                outcome = merge_outcomes(outcome, run_custom(&hub, job.workspace.clone(), run));
+            }
+            outcome
+        };
         {
             let (lock, _) = &*hub;
             let mut shared = lock.lock().unwrap();
@@ -2814,15 +3390,20 @@ fn truncate_output(text: &str) -> String {
 }
 
 fn target_names(job: &Job) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
     if job.full || job.js_full {
-        vec!["<full suite>".to_string()]
+        names.push("<full suite>".to_string());
     } else {
-        job.targets
-            .iter()
-            .chain(job.js_targets.iter())
-            .map(|target| target.to_string_lossy().into_owned())
-            .collect()
+        names.extend(job.targets.iter().chain(job.js_targets.iter()).map(|target| target.to_string_lossy().into_owned()));
+        for run in &job.custom {
+            names.extend(
+                run.targets
+                    .iter()
+                    .map(|target| target.to_string_lossy().into_owned()),
+            );
+        }
     }
+    names
 }
 
 fn failure_lines(failures: &[Failure]) -> String {
@@ -2946,6 +3527,62 @@ fn run_program(program: &str, args: &[String], folder: &Path, env: &[(&str, &str
 fn run_pytest(hub: &Hub, workspace: String, job: &Job) -> Outcome {
     let (config, folder) = workspace_config(hub, workspace);
     let started = Instant::now();
+    let targets: Vec<PathBuf> = if job.full { Vec::new() } else { job.targets.clone() };
+    // A user template rides instead of the built-in runner flags: the same argv expansion
+    // command suites use, with the venv-aware binary when the template names pytest.
+    if !job.py_template.is_empty() {
+        let mut argv = expand_template(&job.py_template, &targets);
+        if argv.is_empty() {
+            return Outcome {
+                status: "no_tests".to_string(),
+                summary: String::new(),
+                failures: vec![],
+                output: String::new(),
+                duration_ms: 0,
+            };
+        }
+        let (program, mut prefix) = if argv[0] == "pytest" {
+            choose_pytest(&folder, &config)
+        } else {
+            (argv[0].clone(), Vec::new())
+        };
+        let mut args = prefix.drain(..).collect::<Vec<String>>();
+        args.extend(argv.drain(1..));
+        let run = run_program(
+            &program,
+            &args,
+            &folder,
+            &[("PYTHONDONTWRITEBYTECODE", "1"), ("PYTHONUNBUFFERED", "1")],
+            config.timeout_s,
+            hub,
+        );
+        if run.timed_out {
+            return Outcome {
+                status: "timeout".to_string(),
+                summary: format!("did not finish in {}s", config.timeout_s),
+                failures: vec![],
+                output: run.output,
+                duration_ms: started.elapsed().as_millis() as u64,
+            };
+        }
+        if run.code.is_none() && run.output.starts_with("could not start") {
+            return Outcome {
+                status: "error".to_string(),
+                summary: run.output.trim().to_string(),
+                failures: vec![],
+                output: run.output,
+                duration_ms: started.elapsed().as_millis() as u64,
+            };
+        }
+        let (status, summary, failures) = parse_result(&run.output, run.code.unwrap_or(-1));
+        return Outcome {
+            status,
+            summary,
+            failures,
+            output: run.output,
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
+    }
     let (program, mut prefix) = choose_pytest(&folder, &config);
     let mut args = prefix.drain(..).collect::<Vec<String>>();
     args.extend(["-q", "--tb=short", "--no-header", "--color=no"].iter().map(|one| one.to_string()));
@@ -2985,6 +3622,70 @@ fn run_pytest(hub: &Hub, workspace: String, job: &Job) -> Outcome {
         status,
         summary,
         failures,
+        output: run.output,
+        duration_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
+/// One command suite: the user's own argv over its resolved targets. No parser can read its
+/// output, so the run is passed or failed by its exit, and the card carries its last line plus
+/// the log. A template with no command is nothing to spawn, not a silent pass.
+fn run_custom(hub: &Hub, workspace: String, run: &CustomRun) -> Outcome {
+    let (config, folder) = workspace_config(hub, workspace);
+    let started = Instant::now();
+    if !run.full && run.targets.is_empty() && !run.template.is_empty() {
+        return Outcome {
+            status: "no_tests".to_string(),
+            summary: String::new(),
+            failures: vec![],
+            output: String::new(),
+            duration_ms: 0,
+        };
+    }
+    let targets: Vec<PathBuf> = if run.full { Vec::new() } else { run.targets.clone() };
+    let mut argv = expand_template(&run.template, &targets);
+    if argv.is_empty() {
+        return Outcome {
+            status: "error".to_string(),
+            summary: format!("suite '{}' has no run command", run.name),
+            failures: vec![],
+            output: run.name.clone(),
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
+    }
+    let program = argv.remove(0);
+    let run = run_program(&program, &argv, &folder, &[], config.timeout_s, hub);
+    if run.timed_out {
+        return Outcome {
+            status: "timeout".to_string(),
+            summary: format!("did not finish in {}s", config.timeout_s),
+            failures: vec![],
+            output: run.output,
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
+    }
+    if run.code.is_none() && run.output.starts_with("could not start") {
+        return Outcome {
+            status: "error".to_string(),
+            summary: run.output.trim().to_string(),
+            failures: vec![],
+            output: run.output,
+            duration_ms: started.elapsed().as_millis() as u64,
+        };
+    }
+    let summary = run
+        .output
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("exit {}", run.code.unwrap_or(-1)));
+    let status = if run.code.unwrap_or(-1) == 0 { "passed" } else { "failed" };
+    Outcome {
+        status: status.to_string(),
+        summary,
+        failures: vec![],
         output: run.output,
         duration_ms: started.elapsed().as_millis() as u64,
     }
@@ -3034,6 +3735,43 @@ fn run_jsts(hub: &Hub, workspace: String, job: &Job) -> Outcome {
             }
         }
     }
+    if !job.js_template.is_empty() {
+        // A user template names the runner and how targets reach it; a full run expands it over
+        // nothing, so the runner's own discovery is the whole suite. Type checking above still
+        // rides along when the suite has work.
+        let has_work = job.js_full || !job.js_targets.is_empty();
+        if has_work {
+            let targets: Vec<PathBuf> = if job.js_full { Vec::new() } else { job.js_targets.clone() };
+            let mut argv = expand_template(&job.js_template, &targets);
+            if !argv.is_empty() {
+                ran = true;
+                let (program, mut prefix) = if argv[0] == "node" {
+                    (choose_node(&config), Vec::new())
+                } else {
+                    (argv[0].clone(), Vec::new())
+                };
+                let mut args = prefix.drain(..).collect::<Vec<String>>();
+                args.extend(argv.drain(1..));
+                let run = run_program(&program, &args, &folder, &[], config.timeout_s, hub);
+                if run.timed_out {
+                    status = "timeout";
+                    summaries.push(format!("did not finish in {}s", config.timeout_s));
+                } else if run.code.is_none() && run.output.starts_with("could not start") {
+                    status = "error";
+                    summaries.push(run.output.trim().to_string());
+                } else {
+                    let (test_status, summary, test_failures) =
+                        parse_tap(&run.output, run.code.unwrap_or(-1));
+                    summaries.push(summary);
+                    if test_status == "failed" && status == "passed" {
+                        status = "failed";
+                    }
+                    failures.extend(test_failures);
+                }
+                output.push_str(&run.output);
+            }
+        }
+    } else {
     let tests: Vec<PathBuf> = if job.js_full {
         jsts_files(&folder).into_iter().filter(|file| is_jsts_test_file(file)).collect()
     } else {
@@ -3065,6 +3803,7 @@ fn run_jsts(hub: &Hub, workspace: String, job: &Job) -> Outcome {
             failures.extend(test_failures);
         }
         output.push_str(&run.output);
+    }
     }
     if !ran {
         return Outcome {
@@ -3184,6 +3923,7 @@ fn settings_view_of(shared: &Shared) -> Value {
         "debounceMs": shared.config.debounce_ms,
         "timeoutS": shared.config.timeout_s,
         "fullOnConfigChange": shared.config.full_on_config_change,
+        "maxHops": shared.config.max_hops,
     })
 }
 
@@ -3211,8 +3951,8 @@ fn state_snapshot(hub: &Hub, only: &str, selected_lane: Option<&str>) -> Value {
                 "threadId": one.thread_id,
                 "folder": one.folder.to_string_lossy(),
                 "watched": one.watched,
-                // What this folder is watched for, so the panel's switches show the truth the watch is run by.
-                "watch": watch_of(&shared, &one.id).view(),
+                // What this folder is watched for, so the panel's editor shows the truth the watch is run by.
+                "suites": suites_of(&shared, &one.id).iter().map(Suite::view).collect::<Vec<_>>(),
                 "phase": phase,
                 "message": one.message,
                 "timeline": timeline_events_json(one, now),
@@ -3304,15 +4044,15 @@ fn queue_manual_run(hub: &Hub, scope: &str, workspace: &str) -> Value {
         }
     };
     let mut queued = false;
-    // Why nothing was queued, when nothing was: a folder with nothing switched on has nothing to run.
+    // Why nothing was queued, when nothing was: a folder with no suite configured has nothing to run.
     let mut off: Vec<String> = Vec::new();
     for id in ids {
-        let watch = {
+        let suites = {
             let (lock, _) = &**hub;
             let shared = lock.lock().unwrap();
-            watch_of(&shared, &id)
+            suites_of(&shared, &id)
         };
-        if !watch.any() {
+        if suites.is_empty() {
             off.push(id);
             continue;
         }
@@ -3335,22 +4075,96 @@ fn queue_manual_run(hub: &Hub, scope: &str, workspace: &str) -> Value {
             if targets.is_empty() {
                 continue;
             }
-            // A failure names a Python node or a JavaScript file; each side reruns only its own, and
-            // only while that side is switched on.
+            // A failure names a Python node or a JavaScript file; each suite reruns only its own.
+            let has_pytest = suites.iter().any(|suite| suite.is_pytest());
+            let has_node = suites.iter().any(|suite| suite.is_node());
             let mut py_targets = Vec::new();
             let mut js_targets = Vec::new();
+            let mut custom_targets: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
             for target in targets {
-                if target.extension().is_some_and(|ext| JSTS_EXTS.contains(&ext.to_str().unwrap_or(""))) {
-                    if watch.javascript {
+                if target
+                    .extension()
+                    .is_some_and(|ext| JSTS_EXTS.contains(&ext.to_str().unwrap_or("")))
+                {
+                    if has_node {
                         js_targets.push(target);
                     }
-                } else if watch.python {
+                } else if has_pytest {
                     py_targets.push(target);
                 }
             }
-            if py_targets.is_empty() && js_targets.is_empty() {
+            // A command suite reruns files that mention its own targets: the same stem search
+            // resolution used, so a failure that keeps failing is retried as a file, not the suite.
+            // The folder and suites leave the lock first: reading every test body on a big repo
+            // must not stall the panel behind the plugin-wide mutex.
+            {
+                let (lock, _) = &**hub;
+                let folder = {
+                    let shared = lock.lock().unwrap();
+                    shared
+                        .workspaces
+                        .get(&id)
+                        .map(|tracker| tracker.folder.clone())
+                        .unwrap_or_default()
+                };
+                for suite in suites.iter().filter(|suite| suite.is_command()) {
+                    if suite.test_globs.is_empty() || suite.run.is_empty() {
+                        continue;
+                    }
+                    let tests = glob_files(&folder, suite);
+                    let mut covered: Vec<PathBuf> = Vec::new();
+                    for test in tests {
+                        if !covered.contains(&test)
+                            && {
+                                let text = std::fs::read_to_string(folder.join(&test)).unwrap_or_default();
+                                let mut found = false;
+                                for target in py_targets.iter().chain(js_targets.iter()) {
+                                    let stem = file_stem(target);
+                                    if stem.len() >= 2 && text.contains(&stem) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                found
+                            }
+                        {
+                            covered.push(test);
+                        }
+                    }
+                    if !covered.is_empty() {
+                        custom_targets.insert(suite.name.clone(), covered);
+                    }
+                }
+            }
+            if py_targets.is_empty() && js_targets.is_empty() && custom_targets.is_empty() {
                 continue;
             }
+            let mut custom: Vec<CustomRun> = Vec::new();
+            let suite_by_name: BTreeMap<String, Suite> = suites
+                .iter()
+                .filter(|suite| suite.is_command())
+                .map(|suite| (suite.name.clone(), suite.clone()))
+                .collect();
+            for (name, covered) in custom_targets {
+                if let Some(suite) = suite_by_name.get(&name) {
+                    custom.push(CustomRun {
+                        name,
+                        template: suite.run.clone(),
+                        full: false,
+                        targets: covered,
+                    });
+                }
+            }
+            let py_template = suites
+                .iter()
+                .find(|suite| suite.is_pytest())
+                .map(|suite| suite.run.clone())
+                .unwrap_or_default();
+            let js_template = suites
+                .iter()
+                .find(|suite| suite.is_node())
+                .map(|suite| suite.run.clone())
+                .unwrap_or_default();
             push_job(
                 hub,
                 Job {
@@ -3360,22 +4174,62 @@ fn queue_manual_run(hub: &Hub, scope: &str, workspace: &str) -> Value {
                     js_targets,
                     js_full: false,
                     js_typecheck: false,
+                    py_template,
+                    js_template,
+                    custom,
                     reason: "rerun the failures".to_string(),
                 },
             );
             queued = true;
         } else {
-            // A whole-suite run covers only the sides this folder is watched for: a JavaScript folder
-            // never spawns pytest, and a Python one never asks for tsc or node.
+            // A whole-suite run covers only the suites this folder has: a pytest suite never
+            // spawns node, and command suites run their own full-run templates.
+            let mut full = false;
+            let mut js_full = false;
+            let mut py_template = String::new();
+            let mut js_template = String::new();
+            let mut custom: Vec<CustomRun> = Vec::new();
+            for suite in &suites {
+                if suite.is_pytest() {
+                    full = true;
+                    py_template = if !suite.full_run.is_empty() {
+                        suite.full_run.clone()
+                    } else {
+                        suite.run.clone()
+                    };
+                } else if suite.is_node() {
+                    js_full = true;
+                    js_template = if !suite.full_run.is_empty() {
+                        suite.full_run.clone()
+                    } else {
+                        suite.run.clone()
+                    };
+                } else {
+                    custom.push(CustomRun {
+                        name: suite.name.clone(),
+                        template: if !suite.full_run.is_empty() {
+                            suite.full_run.clone()
+                        } else {
+                            suite.run.clone()
+                        },
+                        full: true,
+                        targets: vec![],
+                    });
+                }
+            }
+            let js_typecheck = suites.iter().any(|suite| suite.is_node());
             push_job(
                 hub,
                 Job {
                     workspace: id,
                     targets: vec![],
-                    full: watch.python,
+                    full,
                     js_targets: vec![],
-                    js_full: watch.javascript,
-                    js_typecheck: watch.javascript,
+                    js_full,
+                    js_typecheck,
+                    py_template,
+                    js_template,
+                    custom,
                     reason: "manual run all".to_string(),
                 },
             );
@@ -3485,10 +4339,13 @@ mod tests {
         assert!(parse_args(&["--nope".to_string()]).is_err());
         assert!(parse_args(&["--interval-ms".to_string(), "soon".to_string()]).is_err());
         assert!(parse_args(&["--interval-ms".to_string()]).is_err());
-        // Nothing is watched until a `--watch` arg or the panel says what for.
-        assert_eq!(parse_args(&[]).unwrap().watch_defaults, Watch::default());
+        // Nothing is configured until a `--watch` arg or the panel says what for.
+        assert_eq!(parse_args(&[]).unwrap().watch_defaults, Vec::<Suite>::new());
         let config = parse_args(&["--watch".to_string(), "python".to_string(), "--watch".to_string(), "javascript".to_string()]).unwrap();
-        assert_eq!(config.watch_defaults, Watch { python: true, javascript: true });
+        assert_eq!(
+            config.watch_defaults,
+            vec![Suite::new("python tests", "pytest"), Suite::new("javascript tests", "node")]
+        );
         assert!(parse_args(&["--watch".to_string(), "ruby".to_string()]).is_err(), "an unknown side is refused rather than guessed");
     }
 
@@ -3500,7 +4357,7 @@ mod tests {
         project.write("tests/test_fun.py", "from fun import X\n\ndef test_fun():\n    assert X == 1\n");
         project.write("tests/test_other.py", "def test_other():\n    assert True\n");
         let files: BTreeSet<PathBuf> = [PathBuf::from("lib.py")].into_iter().collect();
-        match resolve_targets(&project.0, &files, false) {
+        match resolve_targets(&project.0, &files, false, &Suite::new("python tests", "pytest"), 16) {
             Resolution::Targets(targets) => {
                 assert_eq!(targets, vec![PathBuf::from("tests/test_fun.py")]);
             }
@@ -3518,14 +4375,17 @@ mod tests {
         );
         project.write("pkg/unused.py", "X = 1\n");
         let files: BTreeSet<PathBuf> = [PathBuf::from("pkg/calc.py")].into_iter().collect();
-        match resolve_targets(&project.0, &files, false) {
+        match resolve_targets(&project.0, &files, false, &Suite::new("python tests", "pytest"), 16) {
             Resolution::Targets(targets) => {
                 assert_eq!(targets, vec![PathBuf::from("tests/test_calc.py")]);
             }
             _ => panic!("a covered source file should resolve to its test"),
         }
         let files: BTreeSet<PathBuf> = [PathBuf::from("pkg/unused.py")].into_iter().collect();
-        assert!(matches!(resolve_targets(&project.0, &files, false), Resolution::NoTests));
+        assert!(matches!(
+            resolve_targets(&project.0, &files, false, &Suite::new("python tests", "pytest"), 16),
+            Resolution::NoTests
+        ));
     }
 
     #[test]
@@ -3534,15 +4394,24 @@ mod tests {
         project.write("tests/test_a.py", "def test_a():\n    pass\n");
         project.write("conftest.py", "");
         let files: BTreeSet<PathBuf> = [PathBuf::from("tests/test_a.py")].into_iter().collect();
-        match resolve_targets(&project.0, &files, false) {
+        match resolve_targets(&project.0, &files, false, &Suite::new("python tests", "pytest"), 16) {
             Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("tests/test_a.py")]),
             _ => panic!("a changed test file covers itself"),
         }
         let files: BTreeSet<PathBuf> = [PathBuf::from("pyproject.toml")].into_iter().collect();
-        assert!(matches!(resolve_targets(&project.0, &files, false), Resolution::NoTests));
-        assert!(matches!(resolve_targets(&project.0, &files, true), Resolution::Full));
+        assert!(matches!(
+            resolve_targets(&project.0, &files, false, &Suite::new("python tests", "pytest"), 16),
+            Resolution::NoTests
+        ));
+        assert!(matches!(
+            resolve_targets(&project.0, &files, true, &Suite::new("python tests", "pytest"), 16),
+            Resolution::Full
+        ));
         let files: BTreeSet<PathBuf> = [PathBuf::from("conftest.py")].into_iter().collect();
-        assert!(matches!(resolve_targets(&project.0, &files, true), Resolution::Full));
+        assert!(matches!(
+            resolve_targets(&project.0, &files, true, &Suite::new("python tests", "pytest"), 16),
+            Resolution::Full
+        ));
     }
 
     #[test]
@@ -3555,12 +4424,12 @@ mod tests {
             "from pkg import one  # a comment\nfrom pkg.two import (\n    Y,\n)\nimport pkg.one\n\ndef test_three():\n    assert one.X + Y == 3\n",
         );
         let files: BTreeSet<PathBuf> = [PathBuf::from("pkg/one.py")].into_iter().collect();
-        match resolve_targets(&project.0, &files, false) {
+        match resolve_targets(&project.0, &files, false, &Suite::new("python tests", "pytest"), 16) {
             Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("tests/test_three.py")]),
             _ => panic!("the import forms should reach the test"),
         }
         let files: BTreeSet<PathBuf> = [PathBuf::from("pkg/two.py")].into_iter().collect();
-        match resolve_targets(&project.0, &files, false) {
+        match resolve_targets(&project.0, &files, false, &Suite::new("python tests", "pytest"), 16) {
             Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("tests/test_three.py")]),
             _ => panic!("a parenthesised continuation should reach the test"),
         }
@@ -3604,23 +4473,35 @@ mod tests {
             debounce_ms: Some(300),
             timeout_s: Some(30),
             full_on_config_change: Some(true),
-            watch: BTreeMap::new(),
+            max_hops: Some(3),
+            suites: BTreeMap::new(),
         };
-        saved.watch.insert("one".to_string(), Watch { python: true, javascript: false });
+        saved.suites.insert("one".to_string(), vec![Suite::new("python tests", "pytest")]);
         saved
-            .watch
-            .insert("two".to_string(), Watch { python: false, javascript: true });
+            .suites
+            .insert("two".to_string(), vec![Suite::new("javascript tests", "node")]);
         saved.write(&path).unwrap();
         let read = Settings::read(&path);
         assert_eq!(read.interval_ms, Some(900));
         assert_eq!(read.full_on_config_change, Some(true));
-        assert_eq!(read.watch.get("one").copied(), Some(Watch { python: true, javascript: false }));
-        assert_eq!(read.watch.get("two").copied(), Some(Watch { python: false, javascript: true }));
+        assert_eq!(read.max_hops, Some(3));
+        assert_eq!(
+            read.suites.get("one").map(Vec::as_slice),
+            Some(vec![Suite::new("python tests", "pytest")].as_slice())
+        );
+        assert_eq!(
+            read.suites.get("two").map(Vec::as_slice),
+            Some(vec![Suite::new("javascript tests", "node")].as_slice())
+        );
         let config = resolve(Given::default(), Some(read)).unwrap();
         assert!(config.full_on_config_change);
-        assert_eq!(config.watch.get("two").copied(), Some(Watch { python: false, javascript: true }));
+        assert_eq!(config.max_hops, 3);
+        assert_eq!(
+            config.suites.get("two").map(Vec::as_slice),
+            Some(vec![Suite::new("javascript tests", "node")].as_slice())
+        );
         // A folder nobody spoke for is watched for nothing at all.
-        assert_eq!(config.watch.get("three").copied(), None);
+        assert!(config.suites.get("three").is_none());
     }
 
     #[test]
@@ -3667,15 +4548,24 @@ mod tests {
         let specs = jsts_imports_of("import { a } from './a';\nimport './side';\nexport * from \"./re\";\nconst { b } = require('./req');\nconst c = import('./dyn');\n/* import { x } from './hidden'; */\nimport {\n  d\n} from './multi';\n");
         assert_eq!(specs, vec!["./a", "./side", "./re", "./req", "./dyn", "./multi"]);
         let files: BTreeSet<PathBuf> = [PathBuf::from("src/calc.ts")].into_iter().collect();
-        match resolve_jsts(&project.0, &files, false) {
+        match resolve_jsts(&project.0, &files, false, &Suite::new("javascript tests", "node"), 16) {
             Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("src/calc.test.ts")]),
             _ => panic!("a covered source file should resolve to its test"),
         }
         let files: BTreeSet<PathBuf> = [PathBuf::from("src/other.ts")].into_iter().collect();
-        assert!(matches!(resolve_jsts(&project.0, &files, false), Resolution::NoTests));
+        assert!(matches!(
+            resolve_jsts(&project.0, &files, false, &Suite::new("javascript tests", "node"), 16),
+            Resolution::NoTests
+        ));
         let files: BTreeSet<PathBuf> = [PathBuf::from("tsconfig.json")].into_iter().collect();
-        assert!(matches!(resolve_jsts(&project.0, &files, false), Resolution::NoTests));
-        assert!(matches!(resolve_jsts(&project.0, &files, true), Resolution::Full));
+        assert!(matches!(
+            resolve_jsts(&project.0, &files, false, &Suite::new("javascript tests", "node"), 16),
+            Resolution::NoTests
+        ));
+        assert!(matches!(
+            resolve_jsts(&project.0, &files, true, &Suite::new("javascript tests", "node"), 16),
+            Resolution::Full
+        ));
         assert!(is_jsts_test_file(&PathBuf::from("src/calc.test.ts")));
         assert!(is_jsts_test_file(&PathBuf::from("test-utils.test.js")));
         assert!(!is_jsts_test_file(&PathBuf::from("src/calc.ts")));
@@ -3709,7 +4599,7 @@ mod tests {
         project.write("src/other.ts", "const note = \"příliš žluťoučký kůň\";\nexport const x = 1;\n");
         project.write("src/calc.test.ts", "import { add } from \"./calc\";\nimport \"node:test\";\n");
         let files: BTreeSet<PathBuf> = [PathBuf::from("src/calc.ts")].into_iter().collect();
-        match resolve_jsts(&project.0, &files, false) {
+        match resolve_jsts(&project.0, &files, false, &Suite::new("javascript tests", "node"), 16) {
             Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("src/calc.test.ts")]),
             _ => panic!("a letter outside ASCII elsewhere in the folder should not stop the resolution"),
         }
@@ -3759,9 +4649,9 @@ mod tests {
             response_frame(1, workspaces),
             response_frame(2, json!({ "types": ["thread.settled"] })),
             call_frame(3, "visual.request", json!({ "workspace": "ws", "method": "state", "params": {} })),
-            // Nothing is switched on yet, so the panel's run all has nothing to run and says so.
+            // Nothing is configured yet, so the panel's run all has nothing to run and says so.
             call_frame(4, "visual.request", json!({ "workspace": "ws", "method": "run", "params": { "scope": "all" } })),
-            call_frame(5, "visual.request", json!({ "workspace": "ws", "method": "set_watch", "params": { "python": true } })),
+            call_frame(5, "visual.request", json!({ "workspace": "ws", "method": "set_suites", "params": { "suites": [Suite::new("python tests", "pytest").view()] } })),
             call_frame(6, "visual.request", json!({ "workspace": "ws", "method": "run", "params": { "scope": "all" } })),
             call_frame(7, "visual.request", json!({ "workspace": "ws", "method": "zap", "params": {} })),
             json!({ "jsonrpc": "2.0", "method": "shutdown" }),
@@ -3775,16 +4665,134 @@ mod tests {
         let state = answer(3).unwrap()["result"].clone();
         assert_eq!(state["workspaces"][0]["id"], json!("ws"));
         assert_eq!(state["workspaces"][0]["watched"], json!(true));
-        assert_eq!(state["workspaces"][0]["watch"], json!({ "python": false, "javascript": false }));
+        assert_eq!(state["workspaces"][0]["suites"], json!([]));
         let refused = answer(4).unwrap()["result"].clone();
-        assert_eq!(refused["queued"], json!(false), "nothing is watched until the panel says what for");
+        assert_eq!(refused["queued"], json!(false), "nothing is configured until the panel says what for");
         assert_eq!(refused["off"], json!(["ws"]));
-        assert_eq!(answer(5).unwrap()["result"]["watch"], json!({ "python": true, "javascript": false }));
+        assert_eq!(
+            answer(5).unwrap()["result"]["suites"],
+            json!([Suite::new("python tests", "pytest").view()])
+        );
         assert_eq!(answer(6).unwrap()["result"]["queued"], json!(true));
         assert_eq!(answer(7).unwrap()["error"]["code"], json!(METHOD_NOT_FOUND));
         let written = std::fs::read_to_string(&settings_path).unwrap();
-        assert!(written.contains("\"ws\""), "the switch survives the process, in the settings file: {written}");
-        assert!(written.contains("\"python\":true"), "and it is the one that was ticked: {written}");
+        assert!(written.contains("\"ws\""), "the suite survives the process, in the settings file: {written}");
+        assert!(written.contains("\"pytest\""), "and it is the pytest suite that was set: {written}");
+    }
+
+    #[test]
+    fn glob_match_is_small_and_segmentwise() {
+        assert!(glob_match("test_*.py", "pkg/test_a.py"), "no slash matches the file name at any depth");
+        assert!(glob_match("*_test.py", "a/b_c_test.py"));
+        assert!(!glob_match("test_*.py", "pkg/helper.py"));
+        assert!(glob_match("tests/**/*.test.ts", "tests/a/b/c.test.ts"), "** spans segments");
+        assert!(glob_match("src/*.test.ts", "src/calc.test.ts"));
+        assert!(!glob_match("src/*.test.ts", "src/nested/calc.test.ts"), "* stays inside one segment");
+        assert!(glob_match("*.test.*", "test/utils.test.js"));
+        assert!(!glob_match("login.*", "src/logout.ts"));
+    }
+
+    #[test]
+    fn the_depth_cap_stops_the_walk_before_a_deep_test_is_read() {
+        let project = Scratch::new("depthcap");
+        project.write("a.py", "X = 1\n");
+        project.write("pkg/b.py", "from a import X\n");
+        project.write("pkg/c.py", "from pkg.b import *\n");
+        project.write("tests/test_c.py", "from pkg.c import X\n\ndef test_c():\n    assert X == 1\n");
+        let files: BTreeSet<PathBuf> = [PathBuf::from("a.py")].into_iter().collect();
+        assert!(matches!(
+            resolve_targets(&project.0, &files, false, &Suite::new("python tests", "pytest"), 2),
+            Resolution::NoTests
+        ), "two hops cannot reach the test three imports away");
+        match resolve_targets(&project.0, &files, false, &Suite::new("python tests", "pytest"), 4) {
+            Resolution::Targets(targets) => {
+                assert_eq!(targets, vec![PathBuf::from("tests/test_c.py")]);
+            }
+            _ => panic!("four hops do reach it"),
+        }
+    }
+
+    #[test]
+    fn expand_template_carries_targets_quotes_and_appended_files() {
+        let targets = vec![PathBuf::from("tests/test_a.py"), PathBuf::from("tests/test_b.py")];
+        assert_eq!(
+            expand_template("pytest -q {targets}", &targets),
+            vec!["pytest", "-q", "tests/test_a.py", "tests/test_b.py"]
+        );
+        assert_eq!(
+            expand_template("pytest -q --rootdir 'my dir'", &targets),
+            vec!["pytest", "-q", "--rootdir", "my dir", "tests/test_a.py", "tests/test_b.py"],
+            "no {{targets}} appends the resolved files"
+        );
+        assert_eq!(expand_template("node --test {targets}", &[]), vec!["node", "--test"], "a full run expands over nothing");
+    }
+
+    #[test]
+    fn a_custom_suite_maps_through_test_bodies_and_runs_whole_without_globs() {
+        let project = Scratch::new("custom");
+        project.write("src/login.ts", "export function login() {}\n");
+        project.write("src/login.test.ts", "import { login } from './login';\n");
+        project.write("src/helper.test.ts", "import { x } from './helper';\n");
+        let suite = Suite {
+            name: "my command".to_string(),
+            preset: "command".to_string(),
+            test_globs: vec!["**/*.test.ts".to_string()],
+            watch_globs: vec!["src/**".to_string()],
+            run: "vitest run {targets}".to_string(),
+            full_run: "vitest run".to_string(),
+            config_files: vec![],
+        };
+        let files: BTreeSet<PathBuf> = [PathBuf::from("src/login.ts")].into_iter().collect();
+        match resolve_custom(&project.0, &files, false, &suite) {
+            Resolution::Targets(targets) => {
+                assert_eq!(targets, vec![PathBuf::from("src/login.test.ts")]);
+            }
+            _ => panic!("a changed source finds the test that mentions its stem"),
+        }
+        let files: BTreeSet<PathBuf> = [PathBuf::from("src/login.test.ts")].into_iter().collect();
+        match resolve_custom(&project.0, &files, false, &suite) {
+            Resolution::Targets(targets) => assert_eq!(targets, vec![PathBuf::from("src/login.test.ts")]),
+            _ => panic!("a changed test runs itself"),
+        }
+        // No test globs means there is nothing to search: the suite's command is the whole run.
+        let bare = Suite::new("bare", "command");
+        let files: BTreeSet<PathBuf> = [PathBuf::from("src/login.ts")].into_iter().collect();
+        assert!(matches!(resolve_custom(&project.0, &files, false, &bare), Resolution::Full));
+    }
+
+    #[test]
+    fn suite_read_rejects_an_unknown_preset() {
+        let bad = json!({ "name": "x", "preset": "ruby" });
+        assert!(Suite::read(&bad).is_none());
+        let good = json!({ "name": "custom", "preset": "command", "run": "make test {targets}" });
+        let suite = Suite::read(&good).unwrap();
+        assert_eq!(suite.name, "custom");
+        assert_eq!(suite.run, "make test {targets}");
+    }
+
+    #[test]
+    fn legacy_switches_open_as_preset_suites() {
+        // A settings file written before suites existed: a switched-on side is its preset suite,
+        // and a side that stayed off contributes nothing.
+        let legacy = json!({
+            "intervalMs": 2000,
+            "watch": {
+                "one": { "python": true, "javascript": false },
+                "two": { "python": false, "javascript": true },
+            }
+        });
+        let project = Scratch::new("legacy");
+        let path = project.0.join("bughound.json");
+        std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+        let read = Settings::read(&path);
+        assert_eq!(
+            read.suites.get("one").map(Vec::as_slice),
+            Some(vec![Suite::new("python tests", "pytest")].as_slice())
+        );
+        assert_eq!(
+            read.suites.get("two").map(Vec::as_slice),
+            Some(vec![Suite::new("javascript tests", "node")].as_slice())
+        );
     }
 
     #[test]
@@ -3804,15 +4812,16 @@ mod tests {
         project.write("pyproject.toml", "[project]\nname = \"x\"\n");
         project.write("src/calc.ts", "export const x = 1;\n");
         project.write("tsconfig.json", "{}\n");
-        let python = scan(&project.0, Watch { python: true, javascript: false });
+        let python = scan(&project.0, &[Suite::new("python tests", "pytest")]);
         let mut seen: Vec<String> = python.keys().map(|path| path.to_string_lossy().into_owned()).collect();
         seen.sort();
         assert_eq!(seen, vec!["pkg/calc.py", "pyproject.toml"]);
-        let js = scan(&project.0, Watch { python: false, javascript: true });
+        let js = scan(&project.0, &[Suite::new("javascript tests", "node")]);
         let mut seen: Vec<String> = js.keys().map(|path| path.to_string_lossy().into_owned()).collect();
         seen.sort();
         assert_eq!(seen, vec!["src/calc.ts", "tsconfig.json"]);
-        assert!(scan(&project.0, Watch::default()).is_empty(), "nothing switched on walks nothing");
+        assert!(scan(&project.0, &[Suite::new("python tests", "pytest")]).len() == python.len(), "scanning twice is stable");
+        assert!(scan(&project.0, &[]).is_empty(), "nothing configured walks nothing");
     }
 }
 
