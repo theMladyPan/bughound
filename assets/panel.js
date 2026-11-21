@@ -191,6 +191,7 @@ function buildLaneButtons(lanes) {
       button = document.createElement("button");
       button.type = "button";
       button.className = "track-label";
+      button.title = "Select this worktree; click again to deselect";
       const name = document.createElement("span");
       name.className = "lane-name";
       const id = document.createElement("span");
@@ -200,7 +201,7 @@ function buildLaneButtons(lanes) {
       button.append(name, id, phase);
       const laneId = lane.id;
       button.addEventListener("click", () => {
-        selectedId = laneId;
+        selectedId = selectedId === laneId ? "" : laneId;
         selectedFailure = null;
         lastLoadedLogId = null;
         render(currentState);
