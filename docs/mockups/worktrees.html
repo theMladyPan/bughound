@@ -26,13 +26,23 @@ code {font-family:var(--mono)}
 .dock-bar {min-height:40px;display:flex;align-items:center;gap:6px 12px;flex-wrap:wrap;padding:6px 14px;border-bottom:1px solid var(--border);font:11px var(--mono);color:var(--muted)}
 .dock-bar h1 {font:12px var(--mono);color:var(--text)}
 .dock-bar button {margin-left:auto;padding:4px 8px;background:var(--card);border:1px solid var(--border);border-radius:6px}
-.dock-body {display:grid;grid-template-columns:minmax(0,1fr) minmax(235px,285px)}
+.dock-body {display:grid;grid-template-columns:minmax(0,1.618fr) minmax(0,1fr)}
 .summary {display:flex;gap:7px;flex-wrap:wrap;padding:12px 14px;background:var(--drawer);border-bottom:1px solid var(--border)}
 .pill {display:inline-flex;align-items:center;gap:6px;padding:3px 7px;border:1px solid var(--border);border-radius:4px;background:var(--bg);font:11px/1.3 var(--mono)}
 .mark {height:8px;width:8px;border-radius:50%;background:currentColor;display:inline-block;flex:none}
 .scan {color:var(--accent)} .settle {color:var(--amber)} .run {color:var(--violet)} .idle {color:var(--muted)} .fail {color:var(--red)} .pass {color:var(--green)}
-.timeline {display:grid;grid-template-columns:clamp(136px,19%,220px) minmax(0,1fr);grid-template-rows:20px repeat(4,44px);padding:9px 14px;background:var(--drawer)}
-.ticks {grid-column:2;display:flex;justify-content:space-between;color:var(--muted);font:10px var(--mono);gap:4px}
+.zoom {display:flex;align-items:center;gap:8px;margin-left:auto;color:var(--muted);font:11px var(--mono)}
+.zoom button {min-width:28px;padding:2px 5px;background:var(--card);border:1px solid var(--border);border-radius:4px}
+.zoom button:disabled {opacity:.5;cursor:default}
+.timeline {display:grid;grid-template-columns:clamp(136px,24%,220px) minmax(0,1fr);grid-template-rows:20px repeat(4,44px) auto;--lane-height:44px;padding:9px 14px;background:var(--drawer)}
+.plot-scroll {grid-column:2;grid-row:1 / 7;overflow-x:auto;min-width:0}
+.plot-scroll:focus-visible {outline:2px solid var(--accent);outline-offset:-2px}
+.plot {min-width:100%;position:relative}
+.ticks {height:20px;display:flex;justify-content:space-between;color:var(--muted);font:10px var(--mono);gap:4px}
+.plot-tracks {height:calc(4 * var(--lane-height));position:relative}
+.failure-dot {position:absolute;transform:translate(-50%,-50%);width:26px;height:26px;padding:0;border:0;border-radius:50%;background:transparent;display:grid;place-items:center}
+.failure-dot::before {content:'';width:12px;height:12px;border:2px solid var(--drawer);border-radius:50%;background:var(--red)}
+.failure-dot:hover::before,.failure-dot[aria-pressed="true"]::before {outline:1px solid var(--red);outline-offset:2px}
 .track-label {grid-column:1;display:grid;grid-template-columns:minmax(0,1fr) auto;align-content:center;column-gap:4px;min-width:0;border:0;border-left:2px solid var(--border);background:transparent;text-align:left;padding:4px 7px;color:var(--text);font-size:11px}
 .track-label[aria-pressed="true"] {border-color:var(--accent);background:#101e30}
 .track-label span {font:10px var(--mono)}
@@ -42,7 +52,7 @@ code {font-family:var(--mono)}
 .timeline-legend span {display:inline-flex;gap:5px;align-items:center}
 .timeline-legend i {display:inline-block;width:11px;height:4px;background:currentColor}
 .timeline-legend .mark {width:10px;height:10px;border:1px solid var(--drawer);outline:1px solid currentColor}
-#timeline-art {grid-column:2;grid-row:2 / span 4;width:100%;height:100%;min-width:0}
+#timeline-art {display:block;width:100%;height:100%}
 .caption {padding:6px 14px;color:var(--muted);border-top:1px solid var(--border);font-size:12px}
 .detail {min-width:0;border-left:1px solid var(--border)}
 .card-head {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:10px 14px;background:var(--head);border-bottom:1px solid var(--border)}
@@ -61,7 +71,10 @@ code {font-family:var(--mono)}
 .secondary summary {cursor:pointer;color:var(--muted)}
 .secondary p,.secondary pre {margin:6px 0;overflow-wrap:anywhere}
 .secondary pre {color:var(--muted);white-space:pre-wrap}
-@media(min-width:711px) {.detail {max-height:330px;overflow:auto}}
+@media(min-width:711px) {
+  .detail {max-height:330px;overflow:auto}
+  .detail .card-head {position:sticky;top:0}
+}
 @media(max-width:710px) {
   .dock-body {grid-template-columns:minmax(0,1fr)}
   .detail {border-left:0;border-top:1px solid var(--border)}
@@ -84,13 +97,18 @@ code {font-family:var(--mono)}
     <section aria-label="Last 60 simulated seconds">
       <div class="summary" aria-label="Current demo activity">
         <span class="pill scan"><i class="mark"></i>1 scanning</span><span class="pill settle"><i class="mark"></i>1 settling</span><span class="pill run"><i class="mark"></i>1 running</span><span class="pill fail"><i class="mark"></i>1 failing</span>
+        <div class="zoom" role="group" aria-label="Timeline zoom"><button id="zoom-out" type="button" aria-label="Zoom out" disabled>−</button><output id="zoom-level" aria-label="Zoom level">1×</output><button id="zoom-in" type="button" aria-label="Zoom in">+</button></div>
       </div>
       <div id="timeline" class="timeline">
-        <div class="ticks" aria-hidden="true"><span>−60s</span><span>−40s</span><span>−20s</span><span>Now</span></div>
-        <canvas id="timeline-art" aria-hidden="true"></canvas>
-        <div class="timeline-legend"><span class="scan"><i></i>Scan</span><span class="settle"><i></i>Settle</span><span class="run"><i></i>Run</span><span class="pass"><i></i>Pass</span><span class="fail"><i class="mark"></i>Failure detected</span></div>
+        <div class="plot-scroll" id="plot-scroll" role="region" aria-label="Scrollable timeline" tabindex="0">
+          <div class="plot" id="plot">
+            <div class="ticks" aria-hidden="true"><span>−60s</span><span>−40s</span><span>−20s</span><span>Now</span></div>
+            <div class="plot-tracks" id="plot-tracks"><canvas id="timeline-art" aria-hidden="true"></canvas></div>
+          </div>
+        </div>
+        <div class="timeline-legend"<span class="scan"><i></i>Scan</span><span class="settle"><i></i>Settle</span><span class="run"><i></i>Run</span><span class="pass"><i></i>Pass</span><span class="fail"><i class="mark"></i>Failure detected</span></div>
       </div>
-      <p class="caption">Select a worktree to see its latest result and event timestamps. Activity is simulated.</p>
+      <p class="caption">Zoom in to scroll through time. Select a red dot to see that test’s log. Activity is simulated.</p>
       <noscript><p class="caption">Enable JavaScript to view the timeline.</p></noscript>
     </section>
     <section class="detail" aria-labelledby="detail-heading">
@@ -102,7 +120,7 @@ code {font-family:var(--mono)}
         <p class="label">Board card</p><p id="routing" class="branch"></p>
       </div>
       <details class="secondary"><summary>Recent events · demo</summary><p id="events"></p></details>
-      <details class="secondary"><summary>Last output · demo</summary><pre id="log"></pre></details>
+      <details class="secondary" id="log-details"><summary id="log-title">Last output · demo</summary><pre id="log"></pre></details>
     </section>
   </div>
 </section>
@@ -110,15 +128,15 @@ code {font-family:var(--mono)}
 'use strict';
 const $ = id => document.getElementById(id);
 const phase = {scan:'Scanning',settle:'Edits settling',run:'Running checks',idle:'Idle',pass:'Passed'};
-const color = {scan:'#58a6ff',settle:'#e3b341',run:'#d2a8ff',pass:'#7ee08c',fail:'#ff9189'};
+const color = {scan:'#58a6ff',settle:'#e3b341',run:'#d2a8ff',pass:'#7ee08c'};
 const data = [
-  {id:'root',name:'Workspace root',branch:'dev',real:true,stage:'scan',result:'Passed',tone:'pass',finding:'The last check passed after an earlier failure.',log:'✓ Previous targeted check passed.',events:[[4,9,'scan'],[9,15,'run'],[24,31,'run'],[31,34,'pass'],[53,60,'scan']],failures:[[15,'workspace.test.ts']]},
+  {id:'root',name:'Workspace root',branch:'dev',real:true,stage:'scan',result:'Passed',tone:'pass',finding:'The last check passed after an earlier failure.',log:'✓ Previous targeted check passed.',events:[[4,9,'scan'],[9,15,'run'],[24,31,'run'],[31,34,'pass'],[53,60,'scan']],failures:[{time:15,test:'workspace.test.ts · discovers enabled suites',log:'✗ discovers enabled suites\nExpected: ["pytest", "node --test"]\nReceived: ["pytest"]'}]},
   {id:'1e724a28',name:'Release 0.7.0',branch:'chore/release-0.7.0-1e724a28',real:true,stage:'settle',result:'No run yet',tone:'idle',finding:'A file changed. Checks will start once the edits settle.',log:'No check output yet.',events:[[48,53,'scan'],[53,60,'settle']],failures:[]},
   {id:'example-a',name:'Board shortcuts',branch:'example/board-shortcuts',stage:'run',result:'Passed',tone:'pass',finding:'Targeted checks are running. The previous run passed.',log:'✓ Previous targeted check passed.',events:[[5,10,'scan'],[10,18,'run'],[18,21,'pass'],[37,43,'scan'],[43,50,'settle'],[50,60,'run']],failures:[]},
-  {id:'example-b',name:'Plugin panel',branch:'example/plugin-panel',stage:'idle',result:'1 failure',tone:'fail',finding:'The panel lost keyboard focus when it reopened.',log:'✗ restores focus on reopen\nExpected: panel trigger focused\nActual: focus moved to board',events:[[10,15,'scan'],[15,20,'settle'],[20,39,'run']],failures:[[39,'panel.test.ts · restores focus on reopen']]}
+  {id:'example-b',name:'Plugin panel',branch:'example/plugin-panel',stage:'idle',result:'1 failure',tone:'fail',finding:'The panel lost keyboard focus when it reopened.',log:'✗ 1 failed, 3 passed',events:[[10,15,'scan'],[15,20,'settle'],[20,39,'run']],failures:[{time:39,test:'panel.test.ts · restores focus on reopen',log:'✗ restores focus on reopen\nExpected: panel trigger focused\nActual: focus moved to board'}]}
 ];
-let selected = 'example-b';
-const buttons = [];
+let selected = 'example-b', zoom = 1;
+const buttons = [], markers = [];
 for (const [i,d] of data.entries()) {
   const button = document.createElement('button');
   button.type = 'button';
@@ -129,21 +147,34 @@ for (const [i,d] of data.entries()) {
   button.addEventListener('click',() => pick(d.id));
   buttons.push([button,d.id]);
   $('timeline').append(button);
+  for (const failure of d.failures) {
+    const marker = document.createElement('button');
+    marker.type = 'button';
+    marker.className = 'failure-dot';
+    marker.style.left = `clamp(13px, ${failure.time/60*100}%, calc(100% - 13px))`;
+    marker.style.top = `${(i+.5)/data.length*100}%`;
+    marker.title = `${timeLabel(failure.time)} · ${failure.test}`;
+    marker.setAttribute('aria-label',`${d.name}, failure detected at ${timeLabel(failure.time)}: ${failure.test}`);
+    marker.addEventListener('click',() => pick(d.id,failure));
+    markers.push([marker,failure]);
+    $('plot-tracks').append(marker);
+  }
 }
 function timeLabel(time) { return time === 60 ? 'Now' : `−${60-time}s`; }
-function pick(id) {
+function pick(id, clickedFailure) {
   selected = id;
   const d = data.find(d => d.id === id);
   for (const [button,key] of buttons) button.setAttribute('aria-pressed',String(key === id));
+  for (const [marker,failure] of markers) marker.setAttribute('aria-pressed',String(failure === clickedFailure));
   $('source-kind').textContent = d.real ? 'Real checkout' : 'Example worktree';
   $('owner').textContent = id === 'root' ? 'Repository root' : `Thread ${id}`;
   $('source-name').textContent = d.name; $('branch').textContent = d.branch;
   $('phase').textContent = phase[d.stage]; $('phase').className = d.stage;
   $('outcome').textContent = d.result; $('outcome').className = d.tone;
   $('finding').textContent = d.finding;
-  const failure = d.failures.at(-1);
+  const failure = clickedFailure ?? d.failures.at(-1);
   if (failure) {
-    const [time,test] = failure;
+    const {time,test} = failure;
     const code = document.createElement('code');
     code.textContent = `${timeLabel(time)} · ${test}`;
     $('finding').append(code);
@@ -151,10 +182,15 @@ function pick(id) {
   $('routing').textContent = d.tone === 'fail' ? `Example failure card linked to thread ${id}.` : 'No open failure card.';
   const events = [
     ...d.events.map(([from,to,s]) => [from,`${timeLabel(from)} to ${timeLabel(to)}: ${phase[s]}`]),
-    ...d.failures.map(([time,test]) => [time,`${timeLabel(time)}: Failure detected (${test})`])
+    ...d.failures.map(({time,test}) => [time,`${timeLabel(time)}: Failure detected (${test})`])
   ];
   $('events').textContent = events.sort(([a],[b]) => a-b).map(([,label]) => label).join(' · ');
-  $('log').textContent = d.log;
+  $('log-title').textContent = clickedFailure ? `Test log · ${timeLabel(clickedFailure.time)} · simulated` : 'Last run output · demo';
+  $('log').textContent = clickedFailure ? clickedFailure.log : d.log;
+  if (clickedFailure) {
+    $('log-details').open = true;
+    $('log-details').scrollIntoView({block:'nearest',inline:'nearest'});
+  }
   drawTimeline();
 }
 function drawTimeline() {
@@ -180,13 +216,22 @@ function drawTimeline() {
       const x = from*w/60, end = to*w/60;
       g.fillStyle = color[s]; g.fillRect(x,y-4*dpr,Math.max(1,end-x-dpr),8*dpr);
     }
-    for (const [time] of d.failures) {
-      g.beginPath(); g.arc(time*w/60,y,6*dpr,0,2*Math.PI);
-      g.fillStyle = color.fail; g.fill();
-      g.strokeStyle = '#0a0f16'; g.lineWidth = 2*dpr; g.stroke();
-    }
+
   }
 }
+function changeZoom(next) {
+  const scroll = $('plot-scroll');
+  const center = (scroll.scrollLeft + scroll.clientWidth/2)/scroll.scrollWidth;
+  zoom = next;
+  $('plot').style.width = `${zoom*100}%`;
+  scroll.scrollLeft = center*scroll.scrollWidth - scroll.clientWidth/2;
+  $('zoom-level').textContent = `${zoom}×`;
+  $('zoom-out').disabled = zoom === 1;
+  $('zoom-in').disabled = zoom === 4;
+  drawTimeline();
+}
+$('zoom-in').addEventListener('click',() => changeZoom(zoom*2));
+$('zoom-out').addEventListener('click',() => changeZoom(zoom/2));
 $('dock-toggle').addEventListener('click',() => {
   const body = $('dock-body'), toggle = $('dock-toggle');
   body.hidden = !body.hidden;
