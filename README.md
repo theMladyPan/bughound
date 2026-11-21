@@ -4,6 +4,8 @@ An optional pi-studio plugin in Rust that watches a workspace folder for file ch
 a test covers changes, immediately runs the targeted check for it — pytest for Python, or the type
 checker plus node --test for JavaScript and TypeScript, or any command a custom suite names.
 
+![The panel, with the activity timeline on the left and the selected check on the right](assets/panel-timeline.png)
+
 A folder is watched for what you configure in its panel: a list of test suites. The suite presets are
 `pytest` and `node`; a custom suite names its own command (`pytest tests/test_mod.py::TestDemo` is
 exactly the shape that works). No suite is configured to start with, so nothing is read and nothing
