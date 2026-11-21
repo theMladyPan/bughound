@@ -21,6 +21,7 @@ const dotEl = document.getElementById("dot");
 const metaEl = document.getElementById("meta");
 const pendingEl = document.getElementById("pending");
 const logEl = document.getElementById("log");
+const detailHeadingEl = document.getElementById("detailHeading");
 const logContextEl = document.getElementById("logContext");
 const runAllBtn = document.getElementById("runAll");
 const runFailedBtn = document.getElementById("runFailed");
@@ -45,6 +46,7 @@ const plotTracksEl = document.getElementById("plotTracks");
 const timelineArtEl = document.getElementById("timelineArt");
 const ticksEl = document.getElementById("ticks");
 
+const NOTHING_ON = "nothing is switched on for this folder";
 const MIN_SECONDS = 60;
 const MAX_SECONDS = 1800;
 const EVENT_COLORS = {
@@ -113,9 +115,50 @@ function describeWatch(watch) {
   return on.length ? `watching ${on.join(" and ")}` : "nothing is switched on";
 }
 
+function activityMessages(state) {
+  const lanes = lanesFrom(state);
+  const lines = [];
+  if (!lanes.length) {
+    return "No Bughound activity yet.\nEnable a test suite in settings to start this feed.";
+  }
+  for (const row of lanes) {
+    const prefix = row.name || row.id;
+    const watch = row.watch || { python: false, javascript: false };
+    if (watch.python !== true && watch.javascript !== true) {
+      lines.push(`${prefix}: nothing is switched on. Select a worktree to set its switches.`);
+    }
+    for (const path of Array.isArray(row.pending) ? row.pending : []) {
+      lines.push(`${prefix}: change detected in ${path}.`);
+    }
+    if (row.phase === "debouncing") {
+      lines.push(`${prefix}: edits are settling; test selection is waiting.`);
+    }
+    if (row.running) {
+      const targets = Array.isArray(row.running.targets) ? row.running.targets : [];
+      if (targets.length) {
+        for (const target of targets) lines.push(`${prefix}: spawning test ${target}.`);
+      } else {
+        lines.push(`${prefix}: spawning the full test suite.`);
+      }
+    }
+    if (row.message && row.message !== NOTHING_ON) {
+      lines.push(`${prefix}: ${row.message}.`);
+    }
+    const last = row.lastRun;
+    if (last) {
+      const targetText = Array.isArray(last.targets) && last.targets.length ? ` (${last.targets.join(", ")})` : "";
+      lines.push(`${prefix}: ${last.status}${targetText} · ${last.summary}`);
+    }
+  }
+  if (!lines.length) {
+    lines.push(`Bughound is watching ${lanes.length} lane${lanes.length === 1 ? "" : "s"}. Select a lane or a failure dot to inspect its log.`);
+  }
+  return lines.join("\n");
+}
+
 async function loadLog(state, lane) {
   if (!lane) {
-    logEl.textContent = "";
+    logEl.textContent = activityMessages(state);
     return;
   }
   if (selectedFailure && selectedFailure.laneId === lane.id) return;
@@ -274,10 +317,6 @@ function render(state) {
   buildLaneButtons(lanes);
   if (selectedFailure && !lanes.some((lane) => lane.id === selectedFailure.laneId)) selectedFailure = null;
 
-  const hasSelection = Boolean(row);
-  selectedEl.hidden = !hasSelection;
-  selectedSplitterEl.hidden = !hasSelection;
-  panelMainEl.classList.toggle("no-selected", !hasSelection);
   if (!row) {
     dotEl.className = "dot";
     metaEl.textContent = "the daemon knows no workspace for this board";
@@ -288,8 +327,9 @@ function render(state) {
     watchPythonEl.disabled = true;
     watchJavascriptEl.disabled = true;
     watchNoteEl.textContent = "select a worktree to set its switches";
-    logContextEl.textContent = "";
-    logEl.textContent = "";
+    detailHeadingEl.textContent = "Bughound messages";
+    logContextEl.textContent = "all lanes";
+    logEl.textContent = activityMessages(state);
     if (state?.settings && document.activeElement !== setIntervalEl && document.activeElement !== setDebounceEl && document.activeElement !== setTimeoutEl && document.activeElement !== fullConfigEl) {
       setIntervalEl.value = state.settings.intervalMs;
       setDebounceEl.value = state.settings.debounceMs;
@@ -332,6 +372,7 @@ function render(state) {
   pauseBtn.textContent = state.paused ? "resume" : "pause";
   runFailedBtn.hidden = !last || last.status === "passed" || last.status === "no_tests";
 
+  detailHeadingEl.textContent = "Selected check";
   if (selectedFailure) {
     logContextEl.textContent = `${row.name} · ${selectedFailure.nodeid} · ${timeAgo(selectedFailure.atMs, nowMs)}`;
     logEl.textContent = selectedFailure.log || "No check output yet.";
@@ -387,8 +428,9 @@ function dragSplitter(handle, start, move) {
     }
     handle.classList.add("dragging");
     const startX = event.clientX;
+    const startY = event.clientY;
     const startValue = start();
-    const onMove = (moveEvent) => move(startValue, moveEvent.clientX - startX);
+    const onMove = (moveEvent) => move(startValue, moveEvent.clientX - startX, moveEvent.clientY - startY);
     const onEnd = () => {
       handle.classList.remove("dragging");
       handle.removeEventListener("pointermove", onMove);
@@ -409,10 +451,17 @@ dragSplitter(laneSplitterEl, () => laneColumnPx, (start, delta) => {
 });
 
 let timelineShare = 61.8;
-dragSplitter(selectedSplitterEl, () => timelineShare, (start, delta) => {
-  const width = Math.max(1, panelMainEl.clientWidth - 6);
-  timelineShare = clampNumber(start + (delta / width) * 100, 30, 80);
-  document.documentElement.style.setProperty("--timeline-share", `${timelineShare}%`);
+let timelineHeightShare = 55;
+dragSplitter(selectedSplitterEl, () => (panelMainEl.clientWidth < 720 ? timelineHeightShare : timelineShare), (start, deltaX, deltaY) => {
+  if (panelMainEl.clientWidth < 720) {
+    const height = Math.max(1, panelMainEl.clientHeight - 6);
+    timelineHeightShare = clampNumber(start + (deltaY / height) * 100, 25, 80);
+    document.documentElement.style.setProperty("--timeline-height", `${timelineHeightShare}%`);
+  } else {
+    const width = Math.max(1, panelMainEl.clientWidth - 6);
+    timelineShare = clampNumber(start + (deltaX / width) * 100, 30, 80);
+    document.documentElement.style.setProperty("--timeline-share", `${timelineShare}%`);
+  }
   drawTimeline();
 });
 
