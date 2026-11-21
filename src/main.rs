@@ -1674,16 +1674,6 @@ fn has_jsts_extension(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn is_ts_extension(name: &str) -> bool {
-    matches!(name.rsplit('.').next(), Some("ts" | "tsx" | "mts" | "cts"))
-}
-
-fn has_ts_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| matches!(ext, "ts" | "tsx" | "mts" | "cts"))
-}
-
 /// A file `node --test` collects: `test.*`, `test-*.*`, `*-test.*`, or `*.test.*`.
 fn is_jsts_test_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|one| one.to_str()) else {
@@ -2399,7 +2389,6 @@ struct ProgramRun {
     code: Option<i32>,
     output: String,
     timed_out: bool,
-    started: Instant,
 }
 
 fn run_program(program: &str, args: &[String], folder: &Path, env: &[(&str, &str)], timeout_s: u64, hub: &Hub) -> ProgramRun {
@@ -2421,7 +2410,6 @@ fn run_program(program: &str, args: &[String], folder: &Path, env: &[(&str, &str
                 code: None,
                 output: format!("could not start {program}: {error}\n"),
                 timed_out: false,
-                started,
             };
         }
     };
@@ -2462,7 +2450,6 @@ fn run_program(program: &str, args: &[String], folder: &Path, env: &[(&str, &str
         code,
         output: text,
         timed_out,
-        started,
     }
 }
 
@@ -2535,7 +2522,6 @@ fn run_jsts(hub: &Hub, workspace: String, job: &Job) -> Outcome {
     let mut summaries: Vec<String> = Vec::new();
     let mut output = String::new();
     let mut ran = false;
-    let mut failed = false;
     let mut status = "passed";
     if job.js_typecheck {
         if let Some(tsc) = choose_tsc(&folder, &config) {
