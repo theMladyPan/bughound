@@ -3071,6 +3071,19 @@ mod tests {
     }
 
     #[test]
+    fn the_manifest_carries_the_version_this_binary_reports() {
+        // One version lives in `Cargo.toml`, and the handshake reports it. `plugin.json` is read by the
+        // daemon before the process has ever run, so it carries a copy: this fails the moment they drift.
+        let manifest: Value = serde_json::from_str(include_str!("../plugin.json")).expect("plugin.json is JSON");
+        let declared = manifest["version"].as_str().unwrap_or("");
+        assert_eq!(
+            declared,
+            PLUGIN_VERSION,
+            "plugin.json carries a copy of Cargo.toml's version: it says {declared}, the binary is {PLUGIN_VERSION}"
+        );
+    }
+
+    #[test]
     fn the_switches_round_trip_through_the_settings_file() {
         let project = Scratch::new("switches");
         let path = project.0.join("bughound.json");

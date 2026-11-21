@@ -50,6 +50,11 @@ The binary lands at `target/release/pi-studio-bughound`, with its panel next to 
 install step. `Cargo.lock` is committed, so the build pins the same `serde_json` this example was
 written against.
 
+The version lives in `Cargo.toml` and nowhere else. The handshake reports it from there, and
+`plugin.json` — which the daemon reads before the plugin has ever run — carries a copy, because a JSON
+manifest has no way to look one up. A release bumps `Cargo.toml` and copies the number into
+`plugin.json`; `cargo test` fails if the two ever disagree, so a stale manifest cannot be shipped.
+
 ## Register it
 
 This plugin declares itself in the `plugin.json` beside its source. Install it with one command:
