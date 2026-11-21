@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bughound · Worktree mockups</title>
+<style>
+:root {color-scheme:dark;--bg:#0d1117;--drawer:#0a0f16;--card:#161b22;--head:#1c2128;--border:#30363d;--text:#e6edf3;--muted:#9da6b1;--accent:#58a6ff;--green:#7ee08c;--amber:#e3b341;--red:#ff9189;--violet:#d2a8ff;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+* {box-sizing:border-box}
+[hidden] {display:none!important}
+body {margin:0;background:var(--bg);color:var(--text);font:14px/1.55 system-ui,sans-serif}
+button,a {font:inherit;color:inherit}
+button {cursor:pointer}
+button:focus-visible,a:focus-visible {outline:2px solid var(--accent);outline-offset:3px}
+.shell {border-bottom:1px solid var(--border);background:var(--card)}
+.shell>div {max-width:1120px;margin:auto;padding:10px 24px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;font:12px var(--mono)}
+.brand {font-weight:750;color:var(--text);font-size:16px}
+.board,.badge {padding:3px 8px;border:1px solid var(--border);border-radius:5px;background:var(--head)}
+.board b {color:var(--accent)}
+.shell .tag {margin-left:auto;color:var(--amber)}
+main {max-width:1120px;margin:auto;padding:32px 24px 42px}
+h1,h2,h3,p {margin:0}
+h1 {font-size:clamp(23px,4vw,32px);letter-spacing:-.03em;line-height:1.2}
+h2 {font-size:15px}
+h3 {font-size:14px}
+.kicker,.mono,code,.pill,.label,.index,.badge {font-family:var(--mono)}
+.kicker,.label {font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.kicker {margin-bottom:7px;color:var(--accent)}
+.lede {margin-top:7px;color:var(--muted)}
+nav {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:22px 0 14px}
+nav a {display:flex;gap:10px;align-items:center;padding:10px 12px;text-decoration:none;background:var(--card);border:1px solid var(--border);border-radius:6px;line-height:1.35}
+nav a:hover,.tree-row:hover,.map-node:hover {border-color:var(--accent)}
+nav a[aria-current="page"] {background:#101e30;border-color:#387cca}
+.index {color:var(--accent);font-size:11px}
+nav small {display:block;color:var(--muted);font-size:11px;margin-top:2px}
+.layout {display:grid;grid-template-columns:minmax(0,2.12fr) minmax(240px,1fr);gap:12px;align-items:start}
+.card {border:1px solid var(--border);border-radius:7px;background:var(--card);min-width:0}
+.card-head {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:10px 14px;background:var(--head);border-bottom:1px solid var(--border);border-radius:7px 7px 0 0}
+.card-head small {color:var(--muted);font:11px var(--mono)}
+.summary {display:flex;gap:7px;flex-wrap:wrap;padding:12px 14px;background:var(--drawer);border-bottom:1px solid var(--border)}
+.pill {display:inline-flex;align-items:center;gap:6px;padding:3px 7px;border:1px solid var(--border);border-radius:4px;background:var(--bg);font-size:11px;line-height:1.3}
+.mark {height:8px;width:8px;border-radius:50%;background:currentColor;display:inline-block;flex:none}
+.scan {color:var(--accent)} .settle {color:var(--amber)} .run {color:var(--violet)} .idle {color:var(--muted)} .fail {color:var(--red)} .pass {color:var(--green)}
+.motion .activity.scan .mark {animation:breathe 2s ease-in-out infinite}
+.motion .activity.settle .mark {animation:settle 2.4s ease-out infinite}
+.motion .activity.run .mark {animation:breathe 1.15s ease-in-out infinite}
+@keyframes breathe {50% {box-shadow:0 0 0 4px color-mix(in srgb,currentColor,transparent 74%)}}
+@keyframes settle {0% {box-shadow:0 0 0 4px color-mix(in srgb,currentColor,transparent 70%)} 75%,100% {box-shadow:0 0 0 0 transparent}}
+.scene {background-color:var(--drawer);background-image:radial-gradient(circle at 1px 1px,#21262d 1px,transparent 0);background-size:20px 20px}
+.tree {position:relative;display:grid;gap:8px;padding:16px 15px 16px 53px;min-height:336px}
+.tree svg {position:absolute;left:12px;top:16px;width:40px;height:304px;overflow:visible}
+.tree-row {position:relative;min-height:70px;min-width:0;text-align:left;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:8px 11px;border:1px solid var(--border);border-radius:6px;background:#161b22}
+[aria-pressed="true"]:is(.tree-row,.map-node) {border-color:var(--accent);background:#101e30}
+.row-title {font-weight:650;display:block}
+.row-sub {display:block;color:var(--muted);font:11px/1.5 var(--mono);overflow-wrap:anywhere;margin-top:3px}
+.row-state {display:grid;justify-items:end;gap:4px}
+.row-state small {font-size:11px;white-space:nowrap}
+.caption {padding:10px 14px;color:var(--muted);border-top:1px solid var(--border);font-size:12px}
+.inside {padding:13px 14px}
+.inside h3 {margin:4px 0 2px}
+.branch {overflow-wrap:anywhere;color:var(--muted);font:11px/1.55 var(--mono)}
+.facts {margin:12px 0;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}
+.facts div {background:var(--drawer);border:1px solid var(--border);border-radius:5px;padding:8px;min-width:0}
+.facts dd {margin:3px 0 0;font-size:12px;font-weight:650}
+#finding {margin:5px 0 12px;font-size:13px}
+#testcase {display:block;color:var(--red);overflow-wrap:anywhere;margin-top:5px;font-size:11px}
+.secondary {padding:8px 14px;border-top:1px solid var(--border);font-size:12px}
+.secondary summary {cursor:pointer;color:var(--muted)}
+.secondary p {margin:6px 0;overflow-wrap:anywhere}
+.secondary pre {margin:6px 0;color:var(--muted);overflow-wrap:anywhere;white-space:pre-wrap}
+footer {display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:12px}
+footer button {background:var(--head);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 9px}
+.timeline {position:relative;padding:14px;display:grid;grid-template-columns:clamp(85px,23%,136px) minmax(0,1fr);grid-template-rows:23px repeat(4,62px);min-height:313px}
+.ticks {grid-column:2;display:flex;justify-content:space-between;color:var(--muted);font:10px var(--mono);gap:4px}
+.track-label {grid-column:1;z-index:1;min-width:0;border:0;border-left:2px solid var(--border);background:transparent;text-align:left;padding:4px 7px;color:var(--text);font-size:11px}
+.track-label[aria-pressed="true"] {border-color:var(--accent);background:#101e30}
+.track-label span {display:block;font:10px var(--mono);margin-top:3px}
+.track-label .track-id {color:var(--muted)}
+.timeline-legend {grid-column:1 / -1;display:flex;gap:8px 12px;flex-wrap:wrap;margin:10px 0 0;color:var(--muted);font:10px var(--mono)}
+.timeline-legend span {display:inline-flex;gap:5px;align-items:center}
+#timeline-art {grid-column:2;grid-row:2 / span 4;width:100%;height:100%;min-width:0}
+.map {height:336px;position:relative;isolation:isolate;overflow:hidden}
+.map svg,.map canvas {position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.map-node {position:absolute;width:min(31%,156px);min-height:58px;transform:translate(-50%,-50%);border:1px solid var(--border);border-radius:6px;background:#161b22;padding:6px;line-height:1.3;overflow-wrap:anywhere;font-size:12px}
+.map-node small {display:block;font:10px var(--mono);margin-top:4px}
+.map-node .map-id {color:var(--muted)}
+.map-node.root {border-style:double;border-width:3px}
+#renderer {position:absolute;bottom:6px;right:8px;font:10px var(--mono);color:var(--muted)}
+@media(max-width:780px) {.layout {grid-template-columns:1fr}}
+@media(max-width:500px) {main {padding:22px 12px}.shell>div {padding-inline:12px}nav {gap:4px}nav a {display:block;padding:8px}.index {display:block;margin-bottom:3px}nav small {display:none}.tree {padding-left:36px;padding-right:8px}.tree svg {left:6px;width:30px}.tree-row {padding:6px}.row-state {gap:3px}.row-title {font-size:12px}.map-node {font-size:11px}}
+@media(prefers-reduced-motion:reduce) {.motion .activity .mark {animation:none}}
+</style>
+</head>
+<body>
+<header class="shell"><div><span class="brand">pi</span><span class="board">board of <b>pi-studio</b></span><span class="tag">● UI preview</span></div></header>
+<main>
+  <div class="kicker">Bughound / Worktree monitor</div>
+  <h1>Checks across worktrees</h1>
+  <p class="lede">Real <code>pi-studio</code> checkout and release worktree. Two example worktrees; all check activity and results are simulated.</p>
+  <nav aria-label="Mockup concept">
+    <a href="#lanes" aria-current="page"><span class="index">01</span><span>Branch lanes<small>Git-style overview · SVG</small></span></a>
+    <a href="#timeline"><span class="index">02</span><span>Activity timeline<small>Parallel checks · Canvas 2D</small></span></a>
+    <a href="#map"><span class="index">03</span><span>Worktree map<small>Branch exploration · WebGL</small></span></a>
+  </nav>
+  <noscript><p>Enable JavaScript to switch between the mockups and inspect worktree results.</p></noscript>
+  <div class="layout">
+    <section class="card" aria-labelledby="concept">
+      <div class="card-head"><h2 id="concept">Branch lanes</h2><small>3 worktrees + root</small></div>
+      <div class="summary" aria-label="Demo activity summary">
+        <span class="pill scan"><i class="mark"></i>1 scanning</span><span class="pill settle"><i class="mark"></i>1 settling</span><span class="pill run"><i class="mark"></i>1 running</span><span class="pill fail"><i class="mark"></i>1 failing</span>
+      </div>
+      <div id="lanes" class="scene tree" aria-label="Worktrees branching from the root"></div>
+      <div id="timeline" class="scene timeline" aria-label="Worktree activity over the last 60 simulated seconds" hidden>
+        <div class="ticks" aria-hidden="true"><span>−60s</span><span>−40s</span><span>−20s</span><span>Now</span></div>
+        <canvas id="timeline-art" aria-hidden="true"></canvas>
+        <div class="timeline-legend"><span class="scan"><i class="mark"></i>Scan</span><span class="settle"><i class="mark"></i>Settle</span><span class="run"><i class="mark"></i>Run</span><span class="pass"><i class="mark"></i>Pass</span><span class="fail"><i class="mark"></i>Fail</span></div>
+      </div>
+      <div id="map" class="scene map" aria-label="Root and connected worktrees" hidden>
+        <svg id="map-fallback" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"></svg>
+        <canvas id="map-art" aria-hidden="true" hidden></canvas>
+        <span id="renderer">SVG fallback</span>
+      </div>
+      <p class="caption" id="caption"></p>
+    </section>
+    <section class="card" aria-labelledby="detail-heading">
+      <div class="card-head"><h2 id="detail-heading">Selected check</h2><small id="source-kind"></small></div>
+      <div class="inside" aria-live="polite">
+        <p class="label" id="owner"></p><h3 id="source-name"></h3><p class="branch" id="branch"></p>
+        <dl class="facts"><div><dt class="label">Activity</dt><dd id="phase"></dd></div><div><dt class="label">Latest result</dt><dd id="outcome"></dd></div></dl>
+        <p class="label">What happened</p><p id="finding"></p>
+        <p class="label">Board card</p><p id="routing" class="branch"></p>
+      </div>
+      <details class="secondary"><summary>Recent events · demo</summary><p id="events"></p></details>
+      <details class="secondary"><summary>Last output · demo</summary><pre id="log"></pre></details>
+    </section>
+  </div>
+  <footer><span>Standalone mockups · No watching, runs, or board writes</span><button id="motion" type="button" aria-pressed="true">Animation: on</button></footer>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const phase = {scan:'Scanning',settle:'Edits settling',run:'Running checks',idle:'Idle',pass:'Passed',fail:'Failed'};
+const color = {scan:'#58a6ff',settle:'#e3b341',run:'#d2a8ff',idle:'#9da6b1',pass:'#7ee08c',fail:'#ff9189'};
+const data = [
+  {id:'root',name:'Workspace root',branch:'dev',real:true,stage:'scan',result:'Passed',tone:'pass',finding:'The previous check passed. Bughound is scanning the root for changes.',log:'✓ Previous targeted check passed.',events:[[4,9,'scan'],[9,15,'run'],[15,18,'pass'],[53,60,'scan']],xy:[50,49]},
+  {id:'1e724a28',name:'Release 0.7.0',branch:'chore/release-0.7.0-1e724a28',real:true,stage:'settle',result:'No run yet',tone:'idle',finding:'A file changed. Checks will start once the edits settle.',log:'No check output yet.',events:[[48,53,'scan'],[53,60,'settle']],xy:[22,22]},
+  {id:'example-a',name:'Board shortcuts',branch:'example/board-shortcuts',stage:'run',result:'Passed',tone:'pass',finding:'Targeted checks are running. The previous run passed.',log:'✓ Previous targeted check passed.',events:[[5,10,'scan'],[10,18,'run'],[18,21,'pass'],[37,43,'scan'],[43,50,'settle'],[50,60,'run']],xy:[78,26]},
+  {id:'example-b',name:'Plugin panel',branch:'example/plugin-panel',stage:'idle',result:'1 failure',tone:'fail',finding:'The panel lost keyboard focus when it reopened.',test:'panel.test.ts · restores focus on reopen',log:'✗ restores focus on reopen\nExpected: panel trigger focused\nActual: focus moved to board',events:[[10,15,'scan'],[15,20,'settle'],[20,39,'run'],[39,43,'fail']],xy:[50,80]}
+];
+const views = {
+  lanes:['Branch lanes','Follow the Git-style branches from the workspace root. Select a row for its latest check.'],
+  timeline:['Activity timeline','Compare worktrees over the same 60 seconds. Select a lane to read its events and check result.'],
+  map:['Worktree map','Follow each branch from the root. Select a node to inspect its check.']
+};
+const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+let motion = !reduced.matches, current = 'lanes', selected = 'example-b';
+const buttons = [];
+const graphLines = data.slice(1).map(d => [data[0].xy,d.xy,d.stage]);
+function makeButton(parent, d, className, markup) {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = className; b.innerHTML = markup;
+  b.setAttribute('aria-label',`${d.name}, ${phase[d.stage]}, latest result: ${d.result}`);
+  b.addEventListener('click',() => pick(d.id));
+  buttons.push([b,d.id]); parent.append(b); return b;
+}
+const pill = d => `<span class="pill activity ${d.stage}"><i class="mark"></i>${phase[d.stage]}</span>`;
+$('lanes').innerHTML = '<svg viewBox="0 0 40 304" preserveAspectRatio="none" aria-hidden="true"><path d="M 9 35 V 251 M 9 35 H 38 M 9 93 Q 9 113 29 113 H 38 M 9 171 Q 9 191 29 191 H 38 M 9 249 Q 9 269 29 269 H 38" fill="none" stroke="#596675" stroke-width="1.5"/><circle cx="9" cy="35" r="5" fill="#58a6ff"/><circle cx="38" cy="113" r="3" fill="#e3b341"/><circle cx="38" cy="191" r="3" fill="#d2a8ff"/><circle cx="38" cy="269" r="3" fill="#9da6b1"/></svg>';
+for (const [i,d] of data.entries()) {
+  makeButton($('lanes'),d,'tree-row',`<span><span class="row-title">${d.name}</span><span class="row-sub">${d.real ? (i ? `Thread ${d.id}` : 'Root · dev') : `${d.id} · Example`}</span></span><span class="row-state">${pill(d)}<small class="${d.tone}">${d.result}</small></span>`);
+  const ref = i ? d.id : 'dev';
+  makeButton($('timeline'),d,'track-label',`${d.name}<span class="track-id">${ref}</span><span class="${d.stage}">${phase[d.stage]}</span>`).style.gridRow = i + 2;
+  const node = makeButton($('map'),d,`map-node ${i ? '' : 'root'}`,`${d.name}<small class="map-id">${ref}</small><small class="activity ${d.stage}"><i class="mark"></i> ${phase[d.stage]}</small><small class="${d.tone}">${d.result}</small>`);
+  node.style.left = `${d.xy[0]}%`; node.style.top = `${d.xy[1]}%`;
+}
+$('map-fallback').innerHTML = graphLines.map(([a,b,s]) => `<line x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" stroke="${color[s]}" stroke-width="2" vector-effect="non-scaling-stroke" opacity=".65"/>`).join('');
+function pick(id) {
+  selected = id;
+  const d = data.find(d => d.id === id);
+  for (const [button,key] of buttons) button.setAttribute('aria-pressed',String(key === id));
+  $('source-kind').textContent = d.real ? 'Real checkout' : 'Example worktree';
+  $('owner').textContent = id === 'root' ? 'Repository root' : `Thread ${id}`;
+  $('source-name').textContent = d.name; $('branch').textContent = d.branch;
+  $('phase').textContent = phase[d.stage]; $('phase').className = d.stage;
+  $('outcome').textContent = d.result; $('outcome').className = d.tone;
+  $('finding').textContent = d.finding;
+  if (d.test) {const code = document.createElement('code'); code.id = 'testcase'; code.textContent = d.test; $('finding').append(code);}
+  $('routing').textContent = d.test ? `Example failure card linked to thread ${id}.` : 'No failure card in this scenario.';
+  $('events').textContent = d.events.map(([from,to,s]) => `${from-60}s to ${to-60}s: ${phase[s]}`).join(' · ');
+  $('log').textContent = d.log;
+  drawTimeline();
+}
+function fit(canvas) {
+  const {width,height} = canvas.getBoundingClientRect();
+  const ratio = Math.min(devicePixelRatio || 1,2);
+  const w = Math.round(width*ratio), h = Math.round(height*ratio);
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
+  return [w,h,ratio];
+}
+function drawTimeline() {
+  if (current !== 'timeline') return;
+  const c = $('timeline-art'), g = c.getContext('2d');
+  if (!g) return;
+  const [w,h,dpr] = fit(c);
+  if (!w || !h) return;
+  g.clearRect(0,0,w,h);
+  g.lineWidth = dpr;
+  for (let i=0;i<=3;i++) {
+    const x = Math.min(w-dpr,(w-dpr)*i/3+dpr/2);
+    g.strokeStyle = i === 3 ? '#596675' : '#30363d';
+    g.beginPath(); g.moveTo(x,0); g.lineTo(x,h); g.stroke();
+  }
+  for (const [i,d] of data.entries()) {
+    const lane = h/data.length, y = (i+.5)*lane;
+    g.fillStyle = d.id === selected ? '#142339' : '#161b22'; g.fillRect(0,y-13*dpr,w,26*dpr);
+    for (const [from,to,s] of d.events) {
+      const x = from*w/60, end = to*w/60;
+      g.fillStyle = color[s]; g.fillRect(x,y-4*dpr,Math.max(1,end-x-dpr),8*dpr);
+    }
+  }
+}
+let renderMap, frame = 0;
+function webglMap() {
+  const canvas = $('map-art'), gl = canvas.getContext('webgl',{antialias:true});
+  if (!gl) return null;
+  const shader = (type,source) => {
+    const s = gl.createShader(type); gl.shaderSource(s,source); gl.compileShader(s);
+    if (!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  try {
+    const p = gl.createProgram();
+    gl.attachShader(p,shader(gl.VERTEX_SHADER,'attribute vec2 pos; uniform float size; void main(){gl_Position=vec4(pos,0.,1.);gl_PointSize=size;}'));
+    gl.attachShader(p,shader(gl.FRAGMENT_SHADER,'precision mediump float; uniform vec4 ink; uniform bool point; void main(){if(point && distance(gl_PointCoord,vec2(.5))>.5) discard;gl_FragColor=ink;}'));
+    gl.linkProgram(p); if (!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    gl.useProgram(p); gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer());
+    const pos = gl.getAttribLocation(p,'pos'), ink = gl.getUniformLocation(p,'ink'), point = gl.getUniformLocation(p,'point'), size = gl.getUniformLocation(p,'size');
+    gl.vertexAttribPointer(pos,2,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(pos);
+    const draw = (coords,s,alpha,diameter) => {
+      const hex = color[s];
+      gl.uniform4f(ink,...[1,3,5].map(i => parseInt(hex.slice(i,i+2),16)/255),alpha);
+      gl.uniform1i(point,diameter > 0 ? 1 : 0); gl.uniform1f(size,Math.max(1,diameter));
+      gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(coords.flatMap(([x,y]) => [x/50-1,1-y/50])),gl.STREAM_DRAW);
+      gl.drawArrays(diameter ? gl.POINTS : gl.LINES,0,coords.length);
+    };
+    return time => {
+      const [w,h,dpr] = fit(canvas);
+      gl.viewport(0,0,w,h); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+      for (const [i,[a,b,s]] of graphLines.entries()) {
+        draw([a,b],s,.8,0);
+        if (s !== 'idle') {
+          const animate = motion && !reduced.matches;
+          const t = animate && s === 'run' ? .24+.56*((time/1800+i*.32)%1) : .58;
+          const diameter = animate && s === 'settle' ? 4+4*(1-time%2400/2400) : 7;
+          draw([[a[0]+(b[0]-a[0])*t,a[1]+(b[1]-a[1])*t]],s,1,diameter*dpr);
+        }
+      }
+    };
+  } catch {return null;}
+}
+function refreshMap() {
+  cancelAnimationFrame(frame);
+  if (current !== 'map' || !renderMap) return;
+  const loop = time => {
+    renderMap(time);
+    if (motion && !reduced.matches && !document.hidden) frame = requestAnimationFrame(loop);
+  };
+  loop(performance.now());
+}
+function show() {
+  const key = location.hash.slice(1);
+  current = Object.hasOwn(views,key) ? key : 'lanes';
+  for (const name of Object.keys(views)) $(name).hidden = name !== current;
+  for (const link of document.querySelectorAll('nav a')) {
+    if (link.hash === `#${current}`) link.setAttribute('aria-current','page');
+    else link.removeAttribute('aria-current');
+  }
+  [$('concept').textContent,$('caption').textContent] = views[current];
+  if (current === 'map' && renderMap === undefined) {
+    renderMap = webglMap();
+    if (renderMap) {
+      $('map-art').hidden = false; $('map-fallback').hidden = true; $('renderer').textContent = 'WebGL';
+    }
+  }
+  drawTimeline(); refreshMap();
+}
+$('map-art').addEventListener('webglcontextlost',() => {
+  renderMap = null; $('map-art').hidden = true; $('map-fallback').hidden = false; $('renderer').textContent = 'SVG fallback'; refreshMap();
+});
+function setMotion() {
+  const on = motion && !reduced.matches;
+  document.body.classList.toggle('motion',on); $('motion').disabled = reduced.matches;
+  $('motion').setAttribute('aria-pressed',String(on)); $('motion').textContent = `Animation: ${on ? 'on' : 'off'}`;
+  refreshMap();
+}
+$('motion').addEventListener('click',() => {motion = !motion; setMotion();});
+reduced.addEventListener('change',setMotion);
+addEventListener('hashchange',show);
+addEventListener('resize',() => {drawTimeline(); refreshMap();});
+document.addEventListener('visibilitychange',refreshMap);
+pick(selected); setMotion(); show();
+</script>
+</body>
+</html>
