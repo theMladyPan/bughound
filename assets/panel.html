@@ -12,16 +12,16 @@
       <div class="title-block">
         <span class="dot" id="dot" aria-hidden="true"></span>
         <div class="title-copy">
-          <h1 id="panel-title">Bughound activity timeline</h1>
-          <p id="meta" class="meta" role="status">waiting for the board</p>
+          <h1 id="panel-title">Activity timeline</h1>
+          <p id="meta" class="meta visually-hidden" role="status">waiting for the board</p>
         </div>
       </div>
 
       <div class="controls" aria-label="Bughound controls">
-        <button type="button" id="runAll" title="run the selected lane now (r)">run all</button>
-        <button type="button" id="runFailed" title="rerun the last failures (f)" hidden>rerun failed</button>
-        <button type="button" id="pause" title="pause or resume watching (p)">pause</button>
-        <button type="button" id="copy" title="copy the selected log">copy log</button>
+        <button type="button" id="runAll">run all</button>
+        <button type="button" id="runFailed" hidden>rerun failed</button>
+        <button type="button" id="pause">pause</button>
+        <button type="button" id="copy">copy log</button>
 
         <details class="settings" id="settings">
           <summary>settings</summary>
@@ -29,6 +29,7 @@
             <div class="watch-switches">
               <label><input type="checkbox" id="watchPython"> python tests</label>
               <label><input type="checkbox" id="watchJavascript"> javascript tests</label>
+              <label><input type="checkbox" id="fullOnConfigChange"> full run on config change</label>
             </div>
             <p class="note" id="watchNote" role="status"></p>
             <div class="timings">
@@ -44,12 +45,13 @@
     </header>
 
     <section class="panel-main">
-      <section class="timeline-region" aria-label="Worktree activity timeline">
+      <section class="timeline-region" id="timelineRegion" aria-label="Worktree activity timeline" title="Scan (blue) · Settle (yellow) · Run (violet) · Pass (green) · Failure (red)">
         <div class="lane-head" aria-hidden="true">
           <span></span>
           <div class="ticks" id="ticks"><span>−60s</span><span>−40s</span><span>−20s</span><span>Now</span></div>
         </div>
         <div class="lane-scroll" id="laneScroll" tabindex="0" aria-label="Worktree lanes. Mouse wheel scrolls the lanes or zooms the plot.">
+          <div class="vertical-splitter lane-splitter" id="laneSplitter" aria-hidden="true" title="Drag to resize worktree names"></div>
           <div class="plot" id="plot">
             <div class="plot-tracks" id="plotTracks">
               <canvas id="timelineArt" aria-hidden="true"></canvas>
@@ -58,7 +60,8 @@
         </div>
       </section>
 
-      <aside class="selected" aria-labelledby="detailHeading">
+      <div class="vertical-splitter selected-splitter" id="selectedSplitter" aria-hidden="true" title="Drag to resize Selected check"></div>
+      <aside class="selected" id="selected" aria-labelledby="detailHeading" hidden>
         <div class="card-head">
           <h2 id="detailHeading">Selected check</h2>
           <small id="logContext" role="status"></small>
