@@ -22,7 +22,7 @@
 
 body {
   margin: 0;
-  min-height: 100vh;
+  min-height: 0;
   background: var(--drawer);
   color: var(--text);
   font: 12px/1.55 var(--mono);
@@ -34,14 +34,15 @@ button:focus-visible, .lane-scroll:focus-visible, .test-log:focus-visible {
   outline-offset: -2px;
 }
 
-.panel { display: flex; flex-direction: column; min-height: 100vh; }
+.panel { display: flex; flex-direction: column; min-height: 0; height: clamp(280px, 40dvh, 380px); }
 
 .panel-head {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 8px 14px;
-  flex-wrap: wrap;
+  flex: none;
+  min-height: 40px;
   padding: 6px 14px;
   border-bottom: 1px solid var(--border);
   background: var(--drawer);
@@ -54,9 +55,10 @@ button:focus-visible, .lane-scroll:focus-visible, .test-log:focus-visible {
 .dot.work { background: var(--amber); }
 .title-copy { min-width: 0; }
 .panel-head h1 { margin: 0; font-size: 12px; line-height: 1.8; font-weight: 700; }
-.meta { margin: 0; color: var(--muted); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meta { display: none; }
 
 .controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.controls > button { display: none; }
 .controls > button, .settings-panel button {
   padding: 4px 8px;
   background: var(--card);
@@ -143,6 +145,7 @@ button:focus-visible, .lane-scroll:focus-visible, .test-log:focus-visible {
 }
 .track-label[aria-pressed="true"] { border-color: var(--accent); background: #101e30; }
 .track-label span { font-size: 10px; }
+.track-label .lane-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .track-label .track-id { grid-column: 2; grid-row: 1; color: var(--muted); }
 .track-label .lane-phase { grid-column: 1 / -1; margin-top: 2px; color: var(--muted); }
 
@@ -202,6 +205,7 @@ button:focus-visible, .lane-scroll:focus-visible, .test-log:focus-visible {
 .pending { margin: 0; padding: 6px 14px; color: var(--amber); white-space: pre-wrap; }
 
 @media (max-width: 710px) {
+  .panel { height: auto; min-height: 0; }
   .panel-main { grid-template-columns: minmax(0, 1fr); height: auto; }
   .selected { border-left: 0; border-top: 1px solid var(--border); }
   .timeline-region { padding-inline: 8px; }
