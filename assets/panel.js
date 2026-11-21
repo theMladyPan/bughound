@@ -330,8 +330,8 @@ function render(state) {
     runAllBtn.disabled = true;
     runFailedBtn.hidden = true;
     pauseBtn.textContent = state.paused ? "resume" : "pause";
-    renderSuiteEditor(null);
-    suitesNoteEl.textContent = "select a worktree to set its suites";
+    renderSuiteEditor(state);
+    suitesNoteEl.textContent = "the board knows no worktree for this repo";
     detailHeadingEl.textContent = "Bughound messages";
     logContextEl.textContent = "all lanes";
     logEl.textContent = activityMessages(state);
@@ -349,7 +349,7 @@ function render(state) {
   const phase = row.phase || "idle";
   const last = row.lastRun;
   dotEl.className = "dot" + (phase === "running" || phase === "debouncing" ? " work" : last?.status === "failed" ? " bad" : last?.status === "passed" ? " ok" : "");
-  renderSuiteEditor(row);
+  renderSuiteEditor(state);
   runAllBtn.disabled = suitesOf(row).length === 0;
   const bits = [row.name || row.id];
   if (row.threadId) bits.push(row.threadId);
@@ -555,7 +555,11 @@ function linesField(label, value) {
   return { wrap, input };
 }
 
-function renderSuiteEditor(row) {
+function renderSuiteEditor(state) {
+  // Suites belong to the repository, not to the selected worktree: every lane of the board shares
+  // one list, so the editor shows whichever lane is selected and never asks for a selection.
+  const lanes = lanesFrom(state);
+  const row = selectedLane(state) || lanes[0] || null;
   if (!row) {
     suiteListEl.replaceChildren();
     return;
@@ -564,6 +568,7 @@ function renderSuiteEditor(row) {
   if (suitesDirty || editorFocused) return;
   suiteListEl.replaceChildren();
   const suites = suitesOf(row);
+  suitesNoteEl.textContent = describeSuites(row);
   for (const suite of suites) {
     const card = document.createElement("div");
     card.className = "suite-card";
@@ -607,7 +612,6 @@ function renderSuiteEditor(row) {
     card.append(nameField.wrap, presetWrap, testGlobs.wrap, watchGlobs.wrap, run.wrap, fullRun.wrap, configFiles.wrap, remove);
     suiteListEl.appendChild(card);
   }
-  suitesNoteEl.textContent = describeSuites(row);
 }
 
 function collectSuites() {
@@ -630,7 +634,6 @@ function collectSuites() {
 }
 
 async function saveSuites() {
-  if (!selectedId) return;
   suitesDirty = false;
   try {
     const answer = await ask("set_suites", { suites: collectSuites() });
@@ -642,11 +645,7 @@ async function saveSuites() {
 }
 
 function addSuite(name, preset, extra = {}) {
-  if (!selectedId) {
-    suitesNoteEl.textContent = "select a worktree first";
-    return;
-  }
-  renderSuiteEditor(currentState && lanesFrom(currentState).find((lane) => lane.id === selectedId));
+  renderSuiteEditor(currentState);
   const card = document.createElement("div");
   card.className = "suite-card";
   const nameField = field("name", "text", name);
