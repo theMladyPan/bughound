@@ -8,21 +8,20 @@
  *   board → here   { type: "pi-studio.visual.result", nonce, id, result }
  *   board → here   { type: "pi-studio.visual.error", nonce, id, error: { code, message } }
  *
- * `state` is what the page reads, so the page polls it: every second while a run is in flight, every
- * two and a half otherwise. `run` queues a manual run (`scope` is "all" or "failed"), `toggle_pause`
- * pauses or resumes the watching, and `log` hands back the last output. Esc asks the board to close the
- * drawer, beside its own « button. The board adds the workspace this tab belongs to, so nothing here
- * names a folder.
+ * `state` carries worktree lanes, their last 30 minutes of activity, failure dots, and selected-check
+ * logs. The panel polls it; `run` queues a run for the selected lane, `toggle_pause` pauses watching,
+ * and `log` returns the lane's latest output. The board adds the workspace this tab belongs to, so
+ * nothing here names a folder.
  */
 let nonce = "";
 let nextId = 0;
 const pending = new Map();
 
 const dotEl = document.getElementById("dot");
-const phaseEl = document.getElementById("phase");
 const metaEl = document.getElementById("meta");
 const pendingEl = document.getElementById("pending");
 const logEl = document.getElementById("log");
+const logContextEl = document.getElementById("logContext");
 const runAllBtn = document.getElementById("runAll");
 const runFailedBtn = document.getElementById("runFailed");
 const pauseBtn = document.getElementById("pause");
@@ -35,16 +34,43 @@ const saveSettingsBtn = document.getElementById("saveSettings");
 const watchPythonEl = document.getElementById("watchPython");
 const watchJavascriptEl = document.getElementById("watchJavascript");
 const watchNoteEl = document.getElementById("watchNote");
+const laneScrollEl = document.getElementById("laneScroll");
+const plotEl = document.getElementById("plot");
+const plotTracksEl = document.getElementById("plotTracks");
+const timelineArtEl = document.getElementById("timelineArt");
+const ticksEl = document.getElementById("ticks");
+
+const MIN_SECONDS = 60;
+const MAX_SECONDS = 1800;
+const EVENT_COLORS = {
+  scan: "#58a6ff",
+  settle: "#e3b341",
+  run: "#d2a8ff",
+  pass: "#7ee08c",
+};
+const PHASE_LABELS = {
+  scan: "Scanning",
+  settle: "Edits settling",
+  debouncing: "Edits settling",
+  running: "Running checks",
+  idle: "Idle",
+  paused: "Paused",
+  off: "Watch off",
+  unwatched: "Unwatched",
+  no_tests: "No tests",
+};
 
 let pollTimer = 0;
 let pollBusy = false;
 let currentState = null;
+let selectedId = "";
+let selectedFailure = null;
+let visibleSeconds = MIN_SECONDS;
 let lastLoadedLogId = null;
-// A tick is on its way to the plugin: the next poll must not put the old value back under the hand.
+const laneButtons = new Map();
 let watchSaving = false;
 
 function closeDrawer() {
-  // The board's own « does the same thing by calling it directly; this is how Esc arrives.
   window.parent.postMessage({ type: "pi-studio.visual.close", nonce }, "*");
 }
 
@@ -56,80 +82,259 @@ function ask(method, params = {}) {
   });
 }
 
-async function loadLog(state, workspace) {
-  const body = workspace?.lastRun;
-  const logId = body ? `${body.at}-${state?.history?.length ?? 0}` : "none";
-  if (logId === lastLoadedLogId) return;
-  lastLoadedLogId = logId;
-  try {
-    const answer = await ask("log", workspace ? { workspace: workspace.id } : {});
-    logEl.textContent = answer.text || "";
-  } catch (err) {
-    logEl.textContent = err.message || "the log is not there yet";
-  }
+function lanesFrom(state) {
+  return Array.isArray(state?.workspaces) ? state.workspaces : [];
+}
+
+function selectedLane(state) {
+  const lanes = lanesFrom(state);
+  return lanes.find((lane) => lane.id === selectedId)
+    || lanes.find((lane) => lane.phase === "running")
+    || lanes.find((lane) => lane.phase === "debouncing")
+    || lanes[0]
+    || null;
+}
+
+function phaseLabel(row) {
+  if (!row) return "no workspace";
+  return PHASE_LABELS[row.phase] || row.phase || "idle";
+}
+
+function timeAgo(atMs, nowMs) {
+  const seconds = Math.max(0, Math.round((nowMs - atMs) / 1000));
+  return seconds === 0 ? "Now" : `-${seconds}s`;
+}
+
+function ageSeconds(atMs, nowMs) {
+  return Math.max(0, (nowMs - atMs) / 1000);
 }
 
 function describeWatch(watch) {
   const on = [];
   if (watch?.python) on.push("python tests");
   if (watch?.javascript) on.push("javascript tests");
-  return on.length ? `watching ${on.join(" and ")}` : "nothing is switched on for this folder: no scan, no run, no card";
+  return on.length ? `watching ${on.join(" and ")}` : "nothing is switched on";
+}
+
+async function loadLog(state, lane) {
+  if (!lane) {
+    logEl.textContent = "";
+    return;
+  }
+  if (selectedFailure && selectedFailure.laneId === lane.id) return;
+  const body = lane.lastRun;
+  const logId = body ? `${body.at}-${state?.workspaces?.length ?? 0}` : "none";
+  if (logId === lastLoadedLogId) return;
+  lastLoadedLogId = logId;
+  try {
+    const answer = await ask("log", { workspace: lane.id });
+    if (selectedFailure && selectedFailure.laneId === lane.id) return;
+    logEl.textContent = answer.text || "";
+  } catch (err) {
+    logEl.textContent = err.message || "the log is not there yet";
+  }
+}
+
+function buildLaneButtons(lanes) {
+  const scrollTop = laneScrollEl.scrollTop;
+  const nextIds = new Set(lanes.map((lane) => lane.id));
+  for (const [id, button] of laneButtons) {
+    if (!nextIds.has(id)) {
+      button.remove();
+      laneButtons.delete(id);
+    }
+  }
+  laneScrollEl.style.gridTemplateRows = lanes.length ? `repeat(${lanes.length}, var(--lane-height))` : "none";
+  lanes.forEach((lane, index) => {
+    let button = laneButtons.get(lane.id);
+    if (!button) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = "track-label";
+      const name = document.createElement("span");
+      name.className = "lane-name";
+      const id = document.createElement("span");
+      id.className = "track-id";
+      const phase = document.createElement("span");
+      phase.className = "lane-phase";
+      button.append(name, id, phase);
+      const laneId = lane.id;
+      button.addEventListener("click", () => {
+        selectedId = laneId;
+        selectedFailure = null;
+        lastLoadedLogId = null;
+        render(currentState);
+      });
+      laneButtons.set(lane.id, button);
+    }
+    const [name, id, phase] = button.children;
+    name.textContent = lane.name || lane.folder || lane.id;
+    id.textContent = lane.threadId || lane.branch || lane.id;
+    phase.textContent = phaseLabel(lane);
+    button.style.gridRow = String(index + 1);
+    button.setAttribute("aria-pressed", String(lane.id === selectedId));
+    button.setAttribute("aria-label", `${lane.name}, ${phaseLabel(lane)}, latest result: ${lane.lastRun?.status || "no run yet"}`);
+    laneScrollEl.insertBefore(button, plotEl);
+  });
+  laneScrollEl.scrollTop = scrollTop;
+}
+
+function buildFailureDots(lanes, nowMs) {
+  plotTracksEl.querySelectorAll(".failure-dot").forEach((node) => node.remove());
+  lanes.forEach((lane, index) => {
+    for (const failure of Array.isArray(lane.failureEvents) ? lane.failureEvents : []) {
+      const age = ageSeconds(failure.atMs, nowMs);
+      if (age < 0 || age > visibleSeconds) continue;
+      const dot = document.createElement("button");
+      dot.type = "button";
+      dot.className = "failure-dot";
+      const position = Math.min(1, Math.max(0, 1 - age / visibleSeconds));
+      dot.style.left = `clamp(13px, ${position * 100}%, calc(100% - 13px))`;
+      dot.style.top = `${((index + 0.5) / Math.max(1, lanes.length)) * 100}%`;
+      const label = `${lane.name}, failure detected at ${timeAgo(failure.atMs, nowMs)}: ${failure.nodeid}`;
+      dot.title = label;
+      dot.setAttribute("aria-label", label);
+      dot.setAttribute("aria-pressed", String(Boolean(selectedFailure && selectedFailure.laneId === lane.id && selectedFailure.atMs === failure.atMs && selectedFailure.nodeid === failure.nodeid)));
+      dot.addEventListener("click", () => {
+        selectedId = lane.id;
+        const log = failure.log || (Array.isArray(lane.failureEvents) ? lane.failureEvents.find((entry) => entry.atMs === failure.atMs && entry.log)?.log : "") || "";
+        selectedFailure = { laneId: lane.id, atMs: failure.atMs, nodeid: failure.nodeid, log };
+        render(currentState);
+      });
+      plotTracksEl.append(dot);
+    }
+  });
+}
+
+function windowStartMs(nowMs) {
+  return nowMs - visibleSeconds * 1000;
+}
+
+function updateTicks(nowMs) {
+  if (!ticksEl) return;
+  for (let index = 0; index < 4; index += 1) {
+    const secondsAgo = Math.round(visibleSeconds * (1 - index / 3));
+    if (ticksEl.children[index]) ticksEl.children[index].textContent = secondsAgo === 0 ? "Now" : `-${secondsAgo}s`;
+  }
+}
+
+function drawTimeline() {
+  if (!currentState) return;
+  const lanes = lanesFrom(currentState);
+  const nowMs = currentState.nowMs || Date.now();
+  const startMs = windowStartMs(nowMs);
+  const spanMs = Math.max(1, visibleSeconds * 1000);
+  updateTicks(nowMs);
+  buildFailureDots(lanes, nowMs);
+  const canvas = timelineArtEl;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const scale = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.round(rect.width * scale);
+  const height = Math.round(rect.height * scale);
+  canvas.width = width;
+  canvas.height = height;
+  context.clearRect(0, 0, width, height);
+  context.lineWidth = scale;
+
+  for (let index = 0; index <= 3; index += 1) {
+    const x = Math.min(width - scale, (index / 3) * width + scale / 2);
+    context.strokeStyle = index === 3 ? "#596675" : "#30363d";
+    context.beginPath();
+    context.moveTo(x, 0);
+    context.lineTo(x, height);
+    context.stroke();
+  }
+
+  lanes.forEach((lane, index) => {
+    const laneHeight = height / Math.max(1, lanes.length);
+    const y = (index + 0.5) * laneHeight;
+    context.fillStyle = lane.id === selectedId ? "#142339" : "#161b22";
+    context.fillRect(0, y - 13 * scale, width, 26 * scale);
+    for (const segment of Array.isArray(lane.timeline) ? lane.timeline : []) {
+      const color = EVENT_COLORS[segment.kind];
+      if (!color) continue;
+      const clampedStart = Math.max(startMs, segment.startMs || 0);
+      const clampedEnd = Math.min(nowMs, segment.endMs || 0);
+      if (clampedEnd <= clampedStart) continue;
+      const x = (clampedStart - startMs) / spanMs * width;
+      const segmentWidth = Math.max(1, (clampedEnd - clampedStart) / spanMs * width - scale);
+      context.fillStyle = color;
+      context.fillRect(x, y - 4 * scale, segmentWidth, 8 * scale);
+    }
+  });
 }
 
 function render(state) {
   currentState = state;
-  const workspaces = Array.isArray(state?.workspaces) ? state.workspaces : [];
-  const found = workspaces.find((one) => one.phase === "running") || workspaces.find((one) => one.phase === "debouncing") || workspaces[0];
-  if (!found) {
+  const lanes = lanesFrom(state);
+  const row = selectedLane(state);
+  if (row) selectedId = row.id;
+  const nowMs = state?.nowMs || Date.now();
+
+  buildLaneButtons(lanes);
+  if (selectedFailure && !lanes.some((lane) => lane.id === selectedFailure.laneId)) selectedFailure = null;
+
+  if (!row) {
     dotEl.className = "dot";
-    phaseEl.textContent = "no workspace";
     metaEl.textContent = "the daemon knows no workspace for this board";
     pendingEl.hidden = true;
     runFailedBtn.hidden = true;
+    logContextEl.textContent = "";
+    logEl.textContent = "";
     return;
   }
-  const runs = workspaces.filter((one) => one.lastRun);
-  const last = runs.sort((a, b) => b.lastRun.at - a.lastRun.at)[0]?.lastRun;
-  const phase = found.phase || "idle";
-  phaseEl.textContent = phase;
+
+  const phase = row.phase || "idle";
+  const last = row.lastRun;
   dotEl.className = "dot" + (phase === "running" || phase === "debouncing" ? " work" : last?.status === "failed" ? " bad" : last?.status === "passed" ? " ok" : "");
-  const watch = found.watch || { python: false, javascript: false };
+  const watch = row.watch || { python: false, javascript: false };
   if (!watchSaving) {
     watchPythonEl.checked = watch.python === true;
     watchJavascriptEl.checked = watch.javascript === true;
   }
   watchNoteEl.textContent = describeWatch(watch);
   runAllBtn.disabled = watch.python !== true && watch.javascript !== true;
-  const bits = [found.name || found.id];
-  if (found.folder) bits.push(found.folder);
+  const bits = [row.name || row.id];
+  if (row.threadId) bits.push(row.threadId);
   if (watch.python !== true && watch.javascript !== true) bits.push("nothing switched on");
-  if (found.lastScanAt) bits.push(`scanned ${new Date(found.lastScanAt).toLocaleTimeString()}`);
+  if (row.lastScanAt) bits.push(`scanned ${new Date(row.lastScanAt).toLocaleTimeString()}`);
   if (last) bits.push(`${last.status} · ${last.summary} · ${new Date(last.at).toLocaleTimeString()}`);
   metaEl.textContent = bits.join(" · ");
-  const pending = (found.pending || []).slice(0, 8);
+
+  const pending = Array.isArray(row.pending) ? row.pending.slice(0, 8) : [];
   pendingEl.hidden = pending.length === 0;
   if (pending.length) pendingEl.textContent = pending.join("\n");
-  // The settings are the panel's own page of its timings: a poll fills them only while nobody is
-  // typing in them, so a number being edited is never overwritten under the caret.
-  if (state.settings && document.activeElement !== setIntervalEl && document.activeElement !== setDebounceEl && document.activeElement !== setTimeoutEl) {
+
+  if (state?.settings && document.activeElement !== setIntervalEl && document.activeElement !== setDebounceEl && document.activeElement !== setTimeoutEl) {
     setIntervalEl.value = state.settings.intervalMs;
     setDebounceEl.value = state.settings.debounceMs;
     setTimeoutEl.value = state.settings.timeoutS;
   }
   pauseBtn.textContent = state.paused ? "resume" : "pause";
   runFailedBtn.hidden = !last || last.status === "passed" || last.status === "no_tests";
-  void loadLog(state, found);
+
+  if (selectedFailure) {
+    logContextEl.textContent = `${row.name} · ${selectedFailure.nodeid} · ${timeAgo(selectedFailure.atMs, nowMs)}`;
+    logEl.textContent = selectedFailure.log || "";
+  } else {
+    logContextEl.textContent = `${row.name} · ${row.threadId || "pytest"} · ${last ? new Date(last.at).toLocaleTimeString() : "Latest run"}`;
+    void loadLog(state, row);
+  }
+  drawTimeline();
 }
 
 async function poll() {
   if (pollBusy || nonce === "") return;
   pollBusy = true;
   try {
-    const state = await ask("state");
+    const state = await ask("state", selectedId ? { workspace: selectedId } : {});
     render(state);
   } catch (err) {
     dotEl.className = "dot bad";
-    phaseEl.textContent = err.message || "plugin unavailable";
+    metaEl.textContent = err.message || "plugin unavailable";
   } finally {
     pollBusy = false;
     schedulePoll();
@@ -138,19 +343,27 @@ async function poll() {
 
 function schedulePoll() {
   clearTimeout(pollTimer);
-  const fast = currentState && (currentState.workspaces || []).some((one) => one.phase === "running" || one.phase === "debouncing");
+  const fast = currentState && lanesFrom(currentState).some((one) => one.phase === "running" || one.phase === "debouncing");
   pollTimer = setTimeout(() => void poll(), fast ? 1000 : 2500);
 }
 
 async function triggerRun(scope) {
   try {
-    const answer = await ask("run", { scope });
+    const answer = await ask("run", { scope, workspace: selectedId });
     if (answer && answer.queued === false && answer.reason) metaEl.textContent = answer.reason;
     await poll();
   } catch (err) {
     metaEl.textContent = err.message;
   }
 }
+
+plotEl.addEventListener("wheel", (event) => {
+  event.preventDefault();
+  const next = Math.min(MAX_SECONDS, Math.max(MIN_SECONDS, Math.round(visibleSeconds * (event.deltaY > 0 ? 2 : 0.5))));
+  if (next === visibleSeconds) return;
+  visibleSeconds = next;
+  drawTimeline();
+}, { passive: false });
 
 window.addEventListener("message", (event) => {
   if (event.source !== window.parent) return;
@@ -203,8 +416,6 @@ saveSettingsBtn.addEventListener("click", async () => {
   }
 });
 
-// A tick is saved the moment it is made: the settings page has no save button for the watch, because
-// a folder that stops being watched should stop now, and a folder that starts should start now.
 async function saveWatch() {
   watchSaving = true;
   try {
@@ -231,3 +442,5 @@ window.addEventListener("keydown", (event) => {
     else if (event.key === "p") { event.preventDefault(); pauseBtn.click(); }
   }
 });
+
+window.addEventListener("resize", drawTimeline);

@@ -2,46 +2,73 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>bughound</title>
   <link rel="stylesheet" href="panel.css">
 </head>
 <body>
-  <!--
-    Bughound's page, shown in a frame with no origin of its own. It can reach neither the board around
-    it nor the daemon behind it: every call it makes is one message to the board, which asks the plugin
-    through the daemon. `panel.js` holds that conversation. The board adds the workspace this tab
-    belongs to, so the page never names a folder.
+  <main class="panel" aria-labelledby="panel-title">
+    <header class="panel-head">
+      <div class="title-block">
+        <span class="dot" id="dot" aria-hidden="true"></span>
+        <div class="title-copy">
+          <h1 id="panel-title">Bughound activity timeline</h1>
+          <p id="meta" class="meta" role="status">waiting for the board</p>
+        </div>
+      </div>
 
-    No close button of its own here: in the drawers the board already draws the rail's head with its
-    « close. Pressing it or Esc is the same door out, and `panel.js` asks the board to close.
-  -->
-  <div class="rail-head"><span class="dot" id="dot"></span><span id="phase">starting</span></div>
-  <div class="bh-meta" id="meta" role="status">waiting for the board</div>
-  <div class="bh-actions">
-    <button type="button" id="runAll" title="run the whole suite now (r)">▶ run all</button>
-    <button type="button" id="runFailed" title="rerun the last failures (f)" hidden>↻ failed</button>
-    <button type="button" id="pause" title="pause or resume watching (p)">pause</button>
-    <button type="button" id="copy" title="copy the last log">copy log</button>
-  </div>
-  <details class="bh-settings" id="settings">
-    <summary>settings</summary>
-    <!-- What this folder is watched for. Both start off: nothing is scanned and nothing is run until
-         one is ticked, and the tick belongs to this board's folder alone. -->
-    <div class="bh-actions">
-      <label><input type="checkbox" id="watchPython"> python tests</label>
-      <label><input type="checkbox" id="watchJavascript"> javascript tests</label>
-    </div>
-    <p class="bh-note" id="watchNote" role="status"></p>
-    <div class="bh-actions">
-      <label>interval <input type="number" id="setInterval" min="250" step="250"></label>
-      <label>debounce <input type="number" id="setDebounce" min="0" step="100"></label>
-      <label>timeout <input type="number" id="setTimeout" min="1" step="10"></label>
-      <button type="button" id="saveSettings">save settings</button>
-    </div>
-    <p class="bh-note" id="setNote" role="status"></p>
-  </details>
-  <p class="bh-pending" id="pending" hidden></p>
-  <pre id="log" aria-live="polite"></pre>
+      <div class="controls" aria-label="Bughound controls">
+        <button type="button" id="runAll" title="run the selected lane now (r)">run all</button>
+        <button type="button" id="runFailed" title="rerun the last failures (f)" hidden>rerun failed</button>
+        <button type="button" id="pause" title="pause or resume watching (p)">pause</button>
+        <button type="button" id="copy" title="copy the selected log">copy log</button>
+
+        <details class="settings" id="settings">
+          <summary>settings</summary>
+          <div class="settings-panel">
+            <div class="watch-switches">
+              <label><input type="checkbox" id="watchPython"> python tests</label>
+              <label><input type="checkbox" id="watchJavascript"> javascript tests</label>
+            </div>
+            <p class="note" id="watchNote" role="status"></p>
+            <div class="timings">
+              <label>interval <input type="number" id="setInterval" min="250" step="250"></label>
+              <label>debounce <input type="number" id="setDebounce" min="0" step="100"></label>
+              <label>timeout <input type="number" id="setTimeout" min="1" step="10"></label>
+            </div>
+            <button type="button" id="saveSettings">save settings</button>
+            <p class="note" id="setNote" role="status"></p>
+          </div>
+        </details>
+      </div>
+    </header>
+
+    <section class="panel-main">
+      <section class="timeline-region" aria-label="Worktree activity timeline">
+        <div class="lane-head" aria-hidden="true">
+          <span></span>
+          <div class="ticks" id="ticks"><span>−60s</span><span>−40s</span><span>−20s</span><span>Now</span></div>
+        </div>
+        <div class="lane-scroll" id="laneScroll" tabindex="0" aria-label="Worktree lanes. Mouse wheel scrolls the lanes or zooms the plot.">
+          <div class="plot" id="plot">
+            <div class="plot-tracks" id="plotTracks">
+              <canvas id="timelineArt" aria-hidden="true"></canvas>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="selected" aria-labelledby="detailHeading">
+        <div class="card-head">
+          <h2 id="detailHeading">Selected check</h2>
+          <small id="logContext" role="status"></small>
+        </div>
+        <pre class="test-log" id="log" tabindex="0" aria-label="Selected check log"></pre>
+      </aside>
+    </section>
+
+    <p id="pending" class="pending" hidden></p>
+  </main>
   <script src="panel.js"></script>
 </body>
 </html>

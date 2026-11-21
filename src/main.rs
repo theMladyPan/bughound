@@ -490,11 +490,16 @@ impl<T: Transport> Bughound<T> {
             }
         }
         match method {
-            "state" => Ok(state_snapshot(&self.shared, workspace)),
+            "state" => Ok(state_snapshot(
+                &self.shared,
+                workspace,
+                inner.get("workspace").and_then(Value::as_str).filter(|lane| !lane.is_empty()),
+            )),
             "log" => {
                 let workspace = inner
                     .get("workspace")
                     .and_then(Value::as_str)
+                    .filter(|lane| !lane.is_empty())
                     .unwrap_or(workspace);
                 Ok(json!({ "text": last_output(&self.shared, workspace) }))
             }
@@ -512,6 +517,7 @@ impl<T: Transport> Bughound<T> {
                 let workspace = inner
                     .get("workspace")
                     .and_then(Value::as_str)
+                    .filter(|lane| !lane.is_empty())
                     .unwrap_or(workspace);
                 Ok(queue_manual_run(&self.shared, scope, workspace))
             }
@@ -572,10 +578,20 @@ impl<T: Transport> Bughound<T> {
         let watch = {
             let (lock, _) = &*self.shared;
             let mut shared = lock.lock().unwrap();
-            if !shared.workspaces.contains_key(workspace) {
+            let workspace_id = shared
+                .workspaces
+                .get(workspace)
+                .map(|tracker| tracker.workspace_id.clone())
+                .filter(|id| shared.workspaces.values().any(|tracker| tracker.workspace_id == *id))
+                .unwrap_or_else(|| workspace.to_string());
+            if !shared
+                .workspaces
+                .values()
+                .any(|tracker| tracker.workspace_id == workspace_id)
+            {
                 return Err(RpcError::new(INVALID_PARAMS, "this plugin does not know that workspace"));
             }
-            let entry = shared.config.watch.entry(workspace.to_string()).or_default();
+            let entry = shared.config.watch.entry(workspace_id.clone()).or_default();
             if let Some(value) = python {
                 entry.python = value;
             }
@@ -588,7 +604,11 @@ impl<T: Transport> Bughound<T> {
                 eprintln!("bughound: the settings could not be written: {error}");
                 return Err(RpcError::new(-32603, "the settings could not be written"));
             }
-            if let Some(tracker) = shared.workspaces.get_mut(workspace) {
+            for tracker in shared
+                .workspaces
+                .values_mut()
+                .filter(|tracker| tracker.workspace_id == workspace_id)
+            {
                 // The next scan is a baseline again: a side just switched on has files no scan saw.
                 tracker.initialized = false;
                 tracker.snapshot.clear();
@@ -596,6 +616,7 @@ impl<T: Transport> Bughound<T> {
                 tracker.last_change = None;
                 tracker.phase = if watch.any() { "idle".to_string() } else { "off".to_string() };
                 tracker.message = if watch.any() { String::new() } else { NOTHING_ON.to_string() };
+                set_timeline_kind(tracker, "idle", now_ms());
             }
             watch
         };
@@ -644,6 +665,250 @@ fn initialize_answer(params: &Value) -> Result<Value, RpcError> {
     }))
 }
 
+#[derive(Clone, Debug)]
+struct ParsedWorktree {
+    folder: PathBuf,
+    branch: Option<String>,
+}
+
+/// One worktree belonging to a workspace: the checked-out folder and the display identity that lets
+/// the board pair a failure card with the thread that made it.
+#[derive(Clone, Debug)]
+struct WorktreeInfo {
+    folder: PathBuf,
+    branch: String,
+    thread_id: String,
+    is_root: bool,
+}
+
+/// Parse `git worktree list --porcelain` output into folders and branches.
+fn parse_worktree_list(output: &str) -> Vec<ParsedWorktree> {
+    let mut worktrees = Vec::new();
+    let mut folder: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(folder) = folder.take() {
+                worktrees.push(ParsedWorktree {
+                    folder,
+                    branch: branch.take(),
+                });
+            }
+            folder = Some(PathBuf::from(path.trim()));
+            branch = None;
+        } else if let Some(name) = line.strip_prefix("branch ") {
+            let name = name.strip_prefix("refs/heads/").unwrap_or(name);
+            branch = Some(name.trim().to_string());
+        }
+    }
+    if let Some(folder) = folder {
+        worktrees.push(ParsedWorktree { folder, branch });
+    }
+    worktrees
+}
+
+/// Ask Git which worktrees belong to this workspace folder. A folder that is not a Git checkout has
+/// no extra lanes: the caller falls back to the root lane alone.
+fn git_worktree_infos(workspace_id: &str, folder: &Path, workspace_name: &str) -> Option<Vec<WorktreeInfo>> {
+    if folder.as_os_str().is_empty() {
+        return None;
+    }
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(folder)
+        .arg("worktree")
+        .arg("list")
+        .arg("--porcelain")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let parsed = parse_worktree_list(&text);
+    if parsed.is_empty() {
+        return None;
+    }
+    let canonical_folder = folder.canonicalize().unwrap_or_else(|_| folder.to_path_buf());
+    let mut infos = Vec::new();
+    let mut saw_root = false;
+    for entry in parsed {
+        let is_root = entry.folder.canonicalize().unwrap_or_else(|_| entry.folder.clone())
+            == canonical_folder;
+        if is_root {
+            saw_root = true;
+        }
+        let branch = entry.branch.unwrap_or_default();
+        let thread_id = if is_root {
+            if branch.is_empty() {
+                workspace_id.to_string()
+            } else {
+                branch.clone()
+            }
+        } else if let Some(name) = entry.folder.file_name().and_then(|name| name.to_str()) {
+            if entry.folder.components().any(|component| component.as_os_str() == ".agents") {
+                name.to_string()
+            } else if let Some((_, suffix)) = branch.rsplit_once('-') {
+                if suffix.len() == 8 && suffix.chars().all(|character| character.is_ascii_hexdigit()) {
+                    suffix.to_string()
+                } else {
+                    name.to_string()
+                }
+            } else {
+                name.to_string()
+            }
+        } else if branch.is_empty() {
+            "worktree".to_string()
+        } else {
+            branch.clone()
+        };
+        let _ = workspace_name;
+        infos.push(WorktreeInfo {
+            folder: if is_root {
+                folder.to_path_buf()
+            } else {
+                entry.folder
+            },
+            branch,
+            thread_id,
+            is_root,
+        });
+    }
+    if !saw_root {
+        infos.insert(
+            0,
+            WorktreeInfo {
+                folder: folder.to_path_buf(),
+                branch: infos.first().map(|info| info.branch.clone()).unwrap_or_default(),
+                thread_id: infos.first().map(|info| info.thread_id.clone()).unwrap_or_else(|| workspace_id.to_string()),
+                is_root: true,
+            },
+        );
+    }
+    Some(infos)
+}
+
+fn root_worktree_info(folder: &Path, workspace_id: &str) -> WorktreeInfo {
+    WorktreeInfo {
+        folder: folder.to_path_buf(),
+        branch: String::new(),
+        thread_id: workspace_id.to_string(),
+        is_root: true,
+    }
+}
+
+fn worktrees_for_workspace(workspace_id: &str, folder: &Path, workspace_name: &str) -> Vec<WorktreeInfo> {
+    git_worktree_infos(workspace_id, folder, workspace_name)
+        .unwrap_or_else(|| vec![root_worktree_info(folder, workspace_id)])
+}
+
+fn worktree_track_id(workspace_id: &str, info: &WorktreeInfo) -> String {
+    if info.is_root {
+        workspace_id.to_string()
+    } else {
+        format!("{}:{}", workspace_id, info.thread_id)
+    }
+}
+
+fn worktree_card_key(workspace_id: &str, info: &WorktreeInfo) -> String {
+    if info.is_root {
+        format!("bughound:{workspace_id}")
+    } else {
+        format!("bughound:{workspace_id}:{}", info.thread_id)
+    }
+}
+
+fn worktree_display_name(workspace_name: &str, info: &WorktreeInfo) -> String {
+    if info.is_root {
+        workspace_name.to_string()
+    } else if !info.branch.is_empty() {
+        info.branch.clone()
+    } else {
+        info.thread_id.clone()
+    }
+}
+
+fn insert_workspace_trackers(
+    shared: &mut Shared,
+    workspace_id: &str,
+    workspace_name: &str,
+    worktrees: &[WorktreeInfo],
+    watched: bool,
+) {
+    let defaults = shared.config.watch_defaults;
+    if defaults.any() {
+        shared.config.watch.entry(workspace_id.to_string()).or_insert(defaults);
+    }
+    for info in worktrees {
+        let key = worktree_track_id(workspace_id, info);
+        if shared.workspaces.contains_key(&key) {
+            continue;
+        }
+        let card_key = worktree_card_key(workspace_id, info);
+        let mut tracker = WorkspaceTracker::new(
+            workspace_id,
+            &key,
+            worktree_display_name(workspace_name, info),
+            info.folder.clone(),
+            watched,
+            info.thread_id.clone(),
+            info.branch.clone(),
+            info.is_root,
+            card_key,
+        );
+        if !watch_of(shared, &key).any() {
+            tracker.phase = "off".to_string();
+            tracker.message = NOTHING_ON.to_string();
+            tracker.timeline_kind = Some("idle".to_string());
+            tracker.timeline_since = now_ms();
+        }
+        shared.workspaces.insert(key, tracker);
+    }
+}
+
+/// Refresh the worktree lanes for one workspace from Git. Discovery runs outside the shared lock;
+/// only the cheap insert/remove touches it. A failed Git call leaves the old lanes alone.
+fn refresh_workspace_worktrees(hub: &Hub, workspace_id: String, folder: PathBuf, workspace_name: String) {
+    let Some(infos) = git_worktree_infos(&workspace_id, &folder, &workspace_name) else {
+        return;
+    };
+    let (lock, _) = &**hub;
+    let mut shared = lock.lock().unwrap();
+    let watched = shared
+        .workspaces
+        .values()
+        .find(|tracker| tracker.workspace_id == workspace_id && tracker.is_root)
+        .map(|tracker| tracker.watched)
+        .unwrap_or(false);
+    let present: BTreeSet<String> = infos
+        .iter()
+        .map(|info| worktree_track_id(&workspace_id, info))
+        .collect();
+    // A lane whose worktree vanished takes its failure card off with it: the tracker is gone, so
+    // the runner can never remove that card later.
+    let stale_removals: Vec<Value> = shared
+        .workspaces
+        .values()
+        .filter(|tracker| {
+            tracker.workspace_id == workspace_id
+                && !tracker.is_root
+                && !present.contains(&tracker.id)
+                && tracker.card_posted
+        })
+        .map(|tracker| {
+            json!({
+                "workspace": tracker.workspace_id,
+                "key": tracker.card_key,
+            })
+        })
+        .collect();
+    shared.removals.extend(stale_removals);
+    shared.workspaces.retain(|key, tracker| {
+        !(tracker.workspace_id == workspace_id && !tracker.is_root && !present.contains(key))
+    });
+    insert_workspace_trackers(&mut shared, &workspace_id, &workspace_name, &infos, watched);
+}
+
 /// Which workspaces this plugin watches, merged from the daemon's own list. Scratch and missing
 /// workspaces are always skipped: they are not folders a human edits. A `--workspace` allowlist narrows
 /// further, matching ids, names and folders as they are spelled.
@@ -651,16 +916,15 @@ fn apply_workspace_list(shared: &Arc<(Mutex<Shared>, Condvar)>, list: &Value) {
     let Some(rows) = list.get("workspaces").and_then(Value::as_array) else {
         return;
     };
-    let (lock, _) = &**shared;
-    let mut shared = lock.lock().unwrap();
-    let allow = shared.config.workspaces.clone();
+    let allow = {
+        let (lock, _) = &**shared;
+        lock.lock().unwrap().config.workspaces.clone()
+    };
+    let mut additions: Vec<(String, String, Vec<WorktreeInfo>, bool)> = Vec::new();
     for row in rows {
         let Some(id) = row.get("id").and_then(Value::as_str) else {
             continue;
         };
-        if shared.workspaces.contains_key(id) {
-            continue;
-        }
         let name = row
             .get("name")
             .and_then(Value::as_str)
@@ -678,33 +942,47 @@ fn apply_workspace_list(shared: &Arc<(Mutex<Shared>, Condvar)>, list: &Value) {
                 .iter()
                 .any(|one| one == id || one == &name || one == &folder);
         let watched = !scratch && !missing && !folder.is_empty() && allowed;
-        let defaults = shared.config.watch_defaults;
-        shared.workspaces.insert(
-            id.to_string(),
-            WorkspaceTracker::new(id, name, PathBuf::from(folder), watched),
-        );
+        let worktrees = if watched {
+            worktrees_for_workspace(id, Path::new(&folder), &name)
+        } else {
+            vec![root_worktree_info(Path::new(&folder), id)]
+        };
+        additions.push((id.to_string(), name, worktrees, watched));
+    }
+    let (lock, _) = &**shared;
+    let mut shared = lock.lock().unwrap();
+    for (id, name, worktrees, watched) in additions {
+        let already = shared
+            .workspaces
+            .values()
+            .any(|tracker| tracker.workspace_id == id && tracker.is_root);
+        if already {
+            continue;
+        }
         // A `--watch` arg is what the registration asked for, so it seeds every folder the panel has not
         // spoken for. Without one, a folder is watched for nothing until a switch is ticked.
-        if defaults.any() {
-            shared.config.watch.entry(id.to_string()).or_insert(defaults);
-        }
-        if !watch_of(&shared, id).any() {
-            if let Some(tracker) = shared.workspaces.get_mut(id) {
-                tracker.phase = "off".to_string();
-                tracker.message = NOTHING_ON.to_string();
-            }
-        }
+        insert_workspace_trackers(&mut shared, &id, &name, &worktrees, watched);
     }
 }
 
 fn knows(shared: &Arc<(Mutex<Shared>, Condvar)>, workspace: &str) -> bool {
     let (lock, _) = &**shared;
-    lock.lock().unwrap().workspaces.contains_key(workspace)
+    let shared = lock.lock().unwrap();
+    shared.workspaces.contains_key(workspace)
+        || shared
+            .workspaces
+            .values()
+            .any(|tracker| tracker.workspace_id == workspace)
 }
 
 /// What one folder is watched for. A folder the panel has not spoken for is watched for nothing.
 fn watch_of(shared: &Shared, workspace: &str) -> Watch {
-    shared.config.watch.get(workspace).copied().unwrap_or_default()
+    let workspace_id = shared
+        .workspaces
+        .get(workspace)
+        .map(|tracker| tracker.workspace_id.as_str())
+        .unwrap_or_else(|| workspace.split(':').next().unwrap_or(workspace));
+    shared.config.watch.get(workspace_id).copied().unwrap_or_default()
 }
 
 // ---------- configuration ----------
@@ -983,6 +1261,23 @@ struct Failure {
     summary: String,
 }
 
+const TIMELINE_RETENTION_MS: u64 = 30 * 60 * 1000;
+
+#[derive(Clone, Debug)]
+struct TimelineInterval {
+    start_ms: u64,
+    end_ms: u64,
+    kind: String,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineFailure {
+    at_ms: u64,
+    nodeid: String,
+    summary: String,
+    log: Arc<String>,
+}
+
 #[derive(Clone, Debug)]
 struct LastRun {
     at: u64,
@@ -1001,6 +1296,11 @@ struct RunningView {
 /// One workspace under watch: its folder, its snapshot, and what the last change and the last run said.
 struct WorkspaceTracker {
     id: String,
+    workspace_id: String,
+    card_key: String,
+    thread_id: String,
+    branch: String,
+    is_root: bool,
     name: String,
     folder: PathBuf,
     watched: bool,
@@ -1016,12 +1316,31 @@ struct WorkspaceTracker {
     last_run: Option<LastRun>,
     last_scan_at: Option<u64>,
     last_output: String,
+    timeline: Vec<TimelineInterval>,
+    timeline_kind: Option<String>,
+    timeline_since: u64,
+    failure_events: Vec<TimelineFailure>,
 }
 
 impl WorkspaceTracker {
-    fn new(id: &str, name: String, folder: PathBuf, watched: bool) -> Self {
+    fn new(
+        workspace_id: &str,
+        id: &str,
+        name: String,
+        folder: PathBuf,
+        watched: bool,
+        thread_id: String,
+        branch: String,
+        is_root: bool,
+        card_key: String,
+    ) -> Self {
         Self {
             id: id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            card_key,
+            thread_id,
+            branch,
+            is_root,
             name,
             folder,
             watched,
@@ -1037,6 +1356,10 @@ impl WorkspaceTracker {
             last_run: None,
             last_scan_at: None,
             last_output: String::new(),
+            timeline: Vec::new(),
+            timeline_kind: Some("idle".to_string()),
+            timeline_since: now_ms(),
+            failure_events: Vec::new(),
         }
     }
 }
@@ -1061,6 +1384,7 @@ struct Shared {
     jobs: VecDeque<Job>,
     notes: VecDeque<Value>,
     removals: VecDeque<Value>,
+    last_worktree_refresh: u64,
 }
 
 impl Shared {
@@ -1073,6 +1397,7 @@ impl Shared {
             jobs: VecDeque::new(),
             notes: VecDeque::new(),
             removals: VecDeque::new(),
+            last_worktree_refresh: 0,
         }
     }
 }
@@ -1094,6 +1419,93 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn prune_timeline(tracker: &mut WorkspaceTracker, now: u64) {
+    let cutoff = now.saturating_sub(TIMELINE_RETENTION_MS);
+    tracker.timeline.retain(|interval| interval.end_ms >= cutoff);
+    tracker.failure_events.retain(|failure| failure.at_ms >= cutoff);
+}
+
+fn record_timeline_interval(tracker: &mut WorkspaceTracker, start_ms: u64, end_ms: u64, kind: &str) {
+    if end_ms <= start_ms {
+        return;
+    }
+    tracker.timeline.push(TimelineInterval {
+        start_ms,
+        end_ms,
+        kind: kind.to_string(),
+    });
+    prune_timeline(tracker, end_ms);
+}
+
+fn set_timeline_kind(tracker: &mut WorkspaceTracker, kind: &str, now: u64) {
+    if kind == "off" {
+        tracker.timeline_kind = None;
+        return;
+    }
+    if tracker.timeline_kind.as_deref() == Some(kind) {
+        if tracker.timeline_since == 0 {
+            tracker.timeline_since = now;
+        }
+        return;
+    }
+    if let Some(previous) = tracker.timeline_kind.take() {
+        record_timeline_interval(tracker, tracker.timeline_since, now, &previous);
+    }
+    tracker.timeline_kind = Some(kind.to_string());
+    tracker.timeline_since = now;
+}
+
+fn timeline_events_json(tracker: &WorkspaceTracker, now: u64) -> Vec<Value> {
+    let cutoff = now.saturating_sub(TIMELINE_RETENTION_MS);
+    let mut events: Vec<Value> = tracker
+        .timeline
+        .iter()
+        .filter(|interval| interval.end_ms >= cutoff)
+        .map(|interval| {
+            json!({
+                "startMs": interval.start_ms,
+                "endMs": interval.end_ms,
+                "kind": interval.kind,
+            })
+        })
+        .collect();
+    if let Some(kind) = tracker.timeline_kind.as_deref() {
+        if kind != "off" && tracker.timeline_since < now {
+            events.push(json!({
+                "startMs": tracker.timeline_since,
+                "endMs": now,
+                "kind": kind,
+            }));
+        }
+    }
+    events
+}
+
+fn timeline_failures_json(tracker: &WorkspaceTracker, now: u64, include_logs: bool) -> Vec<Value> {
+    let cutoff = now.saturating_sub(TIMELINE_RETENTION_MS);
+    // Every failure of one run shares one log. Only the first timeline dot that run carries it in
+    // full, so a state poll is not forced to resend the same output for each node id.
+    let mut logged_runs: HashSet<u64> = HashSet::new();
+    tracker
+        .failure_events
+        .iter()
+        .filter(|failure| failure.at_ms >= cutoff)
+        .map(|failure| {
+            let log = if include_logs && logged_runs.insert(failure.at_ms) {
+                failure.log.as_ref().clone()
+            } else {
+                String::new()
+            };
+            json!({
+                "atMs": failure.at_ms,
+                "nodeid": failure.nodeid,
+                "summary": failure.summary,
+                "log": log,
+            })
+        })
+        .collect()
 }
 
 /// One manual or watched run, queued if its workspace has no run waiting already.
@@ -1151,6 +1563,31 @@ fn coordinator(hub: Hub) {
                 return;
             }
         }
+        let roots: Vec<(String, PathBuf, String)> = {
+            let (lock, _) = &*hub;
+            let mut shared = lock.lock().unwrap();
+            let should_refresh = now_ms().saturating_sub(shared.last_worktree_refresh) > 5_000;
+            if should_refresh {
+                shared.last_worktree_refresh = now_ms();
+                shared
+                    .workspaces
+                    .values()
+                    .filter(|tracker| tracker.is_root)
+                    .map(|tracker| {
+                        (
+                            tracker.workspace_id.clone(),
+                            tracker.folder.clone(),
+                            tracker.name.clone(),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        for (workspace_id, folder, workspace_name) in roots {
+            refresh_workspace_worktrees(&hub, workspace_id, folder, workspace_name);
+        }
         // Snapshot the folders without the lock in hand: a walk is the slow part. Only a folder the
         // panel switched something on for is walked; the rest cost one check per scan.
         let watched: Vec<(String, PathBuf, Watch)> = {
@@ -1176,6 +1613,7 @@ fn coordinator(hub: Hub) {
                 }
                 continue;
             }
+            let scan_started_at = now_ms();
             let snapshot = scan(&folder, watch);
             let pending: Vec<PathBuf> = {
                 let (lock, _) = &*hub;
@@ -1201,6 +1639,8 @@ fn coordinator(hub: Hub) {
                     tracker.last_change_at = now_ms();
                     if tracker.running.is_none() {
                         tracker.phase = "debouncing".to_string();
+                        set_timeline_kind(tracker, "scan", scan_started_at);
+                        set_timeline_kind(tracker, "settle", now_ms());
                     }
                 }
                 tracker.pending.iter().cloned().collect()
@@ -1298,6 +1738,7 @@ fn coordinator(hub: Hub) {
                     push_job_locked(&mut shared, id.clone(), job);
                 } else {
                     tracker.phase = "no_tests".to_string();
+                    set_timeline_kind(tracker, "idle", now_ms());
                     tracker.message = format!("no tests cover {}", relative_names(&pending));
                     eprintln!("bughound: {id}: no tests cover {}", relative_names(&pending));
                 }
@@ -2187,9 +2628,11 @@ fn runner(hub: Hub) {
                 continue;
             };
             tracker.phase = "running".to_string();
+            let running_started_at = now_ms();
+            set_timeline_kind(tracker, "run", running_started_at);
             tracker.running = Some(RunningView {
                 targets: target_names(&job),
-                started_at: now_ms(),
+                started_at: running_started_at,
             });
         }
         // A side with no work merges away: a TypeScript-only workspace never spawns pytest, and a
@@ -2229,34 +2672,59 @@ fn runner(hub: Hub) {
                     targets: target_names(&job),
                     failures: outcome.failures.clone(),
                 });
+                let finished = now_ms();
                 let mut note = None;
                 let mut removal = None;
                 match outcome.status.as_str() {
                     "failed" | "timeout" | "error" => {
                         tracker.card_posted = true;
+                        set_timeline_kind(tracker, "idle", finished);
+                        let outcome_log = Arc::new(outcome.output.clone());
+                        for failure in &outcome.failures {
+                            tracker.failure_events.push(TimelineFailure {
+                                at_ms: finished,
+                                nodeid: failure.nodeid.clone(),
+                                summary: failure.summary.clone(),
+                                log: Arc::clone(&outcome_log),
+                            });
+                        }
+                        if outcome.failures.is_empty() {
+                            tracker.failure_events.push(TimelineFailure {
+                                at_ms: finished,
+                                nodeid: "error".to_string(),
+                                summary: outcome.summary.clone(),
+                                log: outcome_log,
+                            });
+                        }
+                        prune_timeline(tracker, finished);
                         note = Some(json!({
-                            "workspace": job.workspace,
+                            "workspace": tracker.workspace_id.clone(),
                             "title": format!("bughound: {}", outcome.status),
                             "markdown": format!(
-                                "**{}** — {}\n\n{}\n\n{}",
-                                job.workspace,
+                                "**{} · {}** — {}\n\n{}\n\n{}",
+                                tracker.name,
+                                tracker.thread_id,
                                 outcome.status,
                                 outcome.summary,
                                 failure_lines(&outcome.failures)
                             ),
-                            "key": format!("bughound:{}", job.workspace),
+                            "key": tracker.card_key.clone(),
                         }));
                     }
                     "passed" => {
+                        set_timeline_kind(tracker, "pass", finished);
+                        record_timeline_interval(tracker, finished, finished + 3_000, "pass");
+                        tracker.timeline_kind = Some("idle".to_string());
+                        tracker.timeline_since = finished + 3_000;
                         if tracker.card_posted {
                             tracker.card_posted = false;
                             removal = Some(json!({
-                                "workspace": job.workspace,
-                                "key": format!("bughound:{}", job.workspace),
+                                "workspace": tracker.workspace_id.clone(),
+                                "key": tracker.card_key.clone(),
                             }));
                         }
                     }
-                    _ => {}
+                    _ => set_timeline_kind(tracker, "idle", finished),
                 }
                 (note, removal)
             };
@@ -2696,13 +3164,14 @@ fn settings_view_of(shared: &Shared) -> Value {
     })
 }
 
-fn state_snapshot(hub: &Hub, only: &str) -> Value {
+fn state_snapshot(hub: &Hub, only: &str, selected_lane: Option<&str>) -> Value {
     let (lock, _) = &**hub;
     let shared = lock.lock().unwrap();
+    let now = now_ms();
     let rows: Vec<Value> = shared
         .workspaces
         .values()
-        .filter(|one| only.is_empty() || one.id == only)
+        .filter(|one| only.is_empty() || one.id == only || one.workspace_id == only)
         .map(|one| {
             let phase = if shared.paused {
                 "paused".to_string()
@@ -2711,13 +3180,20 @@ fn state_snapshot(hub: &Hub, only: &str) -> Value {
             };
             json!({
                 "id": one.id,
+                "trackId": one.id,
+                "workspaceId": one.workspace_id,
+                "cardKey": one.card_key,
                 "name": one.name,
+                "branch": one.branch,
+                "threadId": one.thread_id,
                 "folder": one.folder.to_string_lossy(),
                 "watched": one.watched,
                 // What this folder is watched for, so the panel's switches show the truth the watch is run by.
                 "watch": watch_of(&shared, &one.id).view(),
                 "phase": phase,
                 "message": one.message,
+                "timeline": timeline_events_json(one, now),
+                "failureEvents": timeline_failures_json(one, now, selected_lane == Some(one.id.as_str())),
                 "pending": one.pending.iter().map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>(),
                 "running": one.running.as_ref().map(|running| json!({
                     "targets": running.targets,
@@ -2741,6 +3217,7 @@ fn state_snapshot(hub: &Hub, only: &str) -> Value {
         .collect();
     json!({
         "paused": shared.paused,
+        "nowMs": now,
         "phase": computed_phase(&shared),
         "intervalMs": shared.config.interval_ms,
         "debounceMs": shared.config.debounce_ms,
@@ -2773,10 +3250,14 @@ fn last_output(hub: &Hub, workspace: &str) -> String {
             .max_by_key(|one| one.last_run.as_ref().map(|last| last.at).unwrap_or(0))
             .map(|one| one.last_output.clone())
             .unwrap_or_default()
+    } else if let Some(one) = shared.workspaces.get(workspace) {
+        one.last_output.clone()
     } else {
         shared
             .workspaces
-            .get(workspace)
+            .values()
+            .filter(|one| one.workspace_id == workspace)
+            .max_by_key(|one| one.last_run.as_ref().map(|last| last.at).unwrap_or(0))
             .map(|one| one.last_output.clone())
             .unwrap_or_default()
     }
@@ -2791,7 +3272,12 @@ fn queue_manual_run(hub: &Hub, scope: &str, workspace: &str) -> Value {
         } else if shared.workspaces.contains_key(workspace) {
             vec![workspace.to_string()]
         } else {
-            vec![]
+            shared
+                .workspaces
+                .values()
+                .filter(|one| one.workspace_id == workspace)
+                .map(|one| one.id.clone())
+                .collect()
         }
     };
     let mut queued = false;
@@ -3255,6 +3741,16 @@ mod tests {
         let written = std::fs::read_to_string(&settings_path).unwrap();
         assert!(written.contains("\"ws\""), "the switch survives the process, in the settings file: {written}");
         assert!(written.contains("\"python\":true"), "and it is the one that was ticked: {written}");
+    }
+
+    #[test]
+    fn git_worktree_list_names_are_parsed_for_each_lane() {
+        let text = "worktree /repo\nHEAD 1111111111111111111111111111111111111111\nbranch refs/heads/dev\n\nworktree /repo/.agents/1e724a28\nHEAD 2222222222222222222222222222222222222222\nbranch refs/heads/chore/release-0.7.0-1e724a28\n\nworktree /repo-detached\nHEAD 3333333333333333333333333333333333333333\ndetached\n";
+        let parsed = parse_worktree_list(text);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].branch.as_deref(), Some("dev"));
+        assert_eq!(parsed[1].branch.as_deref(), Some("chore/release-0.7.0-1e724a28"));
+        assert_eq!(parsed[2].branch, None);
     }
 
     #[test]
