@@ -54,27 +54,12 @@ code {font-family:var(--mono)}
 .timeline-legend .mark {width:10px;height:10px;border:1px solid var(--drawer);outline:1px solid currentColor}
 #timeline-art {display:block;width:100%;height:100%}
 .caption {padding:6px 14px;color:var(--muted);border-top:1px solid var(--border);font-size:12px}
-.detail {min-width:0;border-left:1px solid var(--border)}
-.card-head {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;padding:10px 14px;background:var(--head);border-bottom:1px solid var(--border)}
-.card-head h2 {font-size:15px}
+.detail {min-width:0;display:flex;flex-direction:column;border-left:1px solid var(--border)}
+.card-head {display:flex;align-items:center;justify-content:space-between;gap:6px 12px;flex-wrap:wrap;padding:8px 14px;background:var(--head);border-bottom:1px solid var(--border)}
+.card-head h2 {font-size:14px}
 .card-head small {color:var(--muted);font:11px var(--mono)}
-.inside {padding:13px 14px}
-.inside h3 {margin:4px 0 2px;font-size:14px}
-.label {color:var(--muted);font:11px var(--mono);letter-spacing:.08em;text-transform:uppercase}
-.branch {overflow-wrap:anywhere;color:var(--muted);font:11px/1.55 var(--mono)}
-.facts {margin:12px 0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-.facts div {background:var(--drawer);border:1px solid var(--border);border-radius:5px;padding:8px;min-width:0}
-.facts dd {margin:3px 0 0;font-size:12px;font-weight:650}
-#finding {margin:5px 0 12px;font-size:13px}
-#finding code {display:block;color:var(--red);overflow-wrap:anywhere;margin-top:5px;font-size:11px}
-.secondary {padding:8px 14px;border-top:1px solid var(--border);font-size:12px}
-.secondary summary {cursor:pointer;color:var(--muted)}
-.secondary p,.secondary pre {margin:6px 0;overflow-wrap:anywhere}
-.secondary pre {color:var(--muted);white-space:pre-wrap}
-@media(min-width:711px) {
-  .detail {max-height:330px;overflow:auto}
-  .detail .card-head {position:sticky;top:0}
-}
+.test-log {flex:1;min-height:0;max-height:285px;margin:0;padding:10px 12px;overflow:auto;background:var(--drawer);font:11px/1.55 var(--mono);tab-size:4}
+.test-log:focus-visible {outline:2px solid var(--accent);outline-offset:-2px}
 @media(max-width:710px) {
   .dock-body {grid-template-columns:minmax(0,1fr)}
   .detail {border-left:0;border-top:1px solid var(--border)}
@@ -112,15 +97,8 @@ code {font-family:var(--mono)}
       <noscript><p class="caption">Enable JavaScript to view the timeline.</p></noscript>
     </section>
     <section class="detail" aria-labelledby="detail-heading">
-      <div class="card-head"><h2 id="detail-heading">Selected check</h2><small id="source-kind"></small></div>
-      <div class="inside" aria-live="polite">
-        <p class="label" id="owner"></p><h3 id="source-name"></h3><p class="branch" id="branch"></p>
-        <dl class="facts"><div><dt class="label">Activity</dt><dd id="phase"></dd></div><div><dt class="label">Latest result</dt><dd id="outcome"></dd></div></dl>
-        <p class="label">What happened</p><p id="finding"></p>
-        <p class="label">Board card</p><p id="routing" class="branch"></p>
-      </div>
-      <details class="secondary"><summary>Recent events · demo</summary><p id="events"></p></details>
-      <details class="secondary" id="log-details"><summary id="log-title">Last output · demo</summary><pre id="log"></pre></details>
+      <div class="card-head"><h2 id="detail-heading">Selected check</h2><small id="log-context" aria-live="polite"></small></div>
+      <pre class="test-log" id="log" tabindex="0" aria-label="Simulated pytest output"></pre>
     </section>
   </div>
 </section>
@@ -129,11 +107,35 @@ code {font-family:var(--mono)}
 const $ = id => document.getElementById(id);
 const phase = {scan:'Scanning',settle:'Edits settling',run:'Running checks',idle:'Idle',pass:'Passed'};
 const color = {scan:'#58a6ff',settle:'#e3b341',run:'#d2a8ff',pass:'#7ee08c'};
+const workspaceFailure = {time:15,test:'tests/test_workspace.py::test_discovers_enabled_suites',log:`F                                                                [100%]
+=============================== FAILURES ===============================
+____________________ test_discovers_enabled_suites _____________________
+tests/test_workspace.py:3: in test_discovers_enabled_suites
+    assert suites == ["pytest", "node --test"]
+E   AssertionError: assert ['pytest'] == ['pytest', 'node --test']
+E
+E     Right contains one more item: 'node --test'
+E     Use -v to get more diff
+======================= short test summary info ========================
+FAILED tests/test_workspace.py::test_discovers_enabled_suites - Asser...
+1 failed in 0.02s`};
+const panelFailure = {time:39,test:'tests/test_panel.py::test_restores_focus_on_reopen',log:`F                                                                [100%]
+=============================== FAILURES ===============================
+____________________ test_restores_focus_on_reopen _____________________
+tests/test_panel.py:3: in test_restores_focus_on_reopen
+    assert focus_target == "panel-trigger"
+E   AssertionError: assert 'board' == 'panel-trigger'
+E
+E     - panel-trigger
+E     + board
+======================= short test summary info ========================
+FAILED tests/test_panel.py::test_restores_focus_on_reopen - Assertion...
+1 failed in 0.02s`};
 const data = [
-  {id:'root',name:'Workspace root',branch:'dev',real:true,stage:'scan',result:'Passed',tone:'pass',finding:'The last check passed after an earlier failure.',log:'✓ Previous targeted check passed.',events:[[4,9,'scan'],[9,15,'run'],[24,31,'run'],[31,34,'pass'],[53,60,'scan']],failures:[{time:15,test:'workspace.test.ts · discovers enabled suites',log:'✗ discovers enabled suites\nExpected: ["pytest", "node --test"]\nReceived: ["pytest"]'}]},
-  {id:'1e724a28',name:'Release 0.7.0',branch:'chore/release-0.7.0-1e724a28',real:true,stage:'settle',result:'No run yet',tone:'idle',finding:'A file changed. Checks will start once the edits settle.',log:'No check output yet.',events:[[48,53,'scan'],[53,60,'settle']],failures:[]},
-  {id:'example-a',name:'Board shortcuts',branch:'example/board-shortcuts',stage:'run',result:'Passed',tone:'pass',finding:'Targeted checks are running. The previous run passed.',log:'✓ Previous targeted check passed.',events:[[5,10,'scan'],[10,18,'run'],[18,21,'pass'],[37,43,'scan'],[43,50,'settle'],[50,60,'run']],failures:[]},
-  {id:'example-b',name:'Plugin panel',branch:'example/plugin-panel',stage:'idle',result:'1 failure',tone:'fail',finding:'The panel lost keyboard focus when it reopened.',log:'✗ 1 failed, 3 passed',events:[[10,15,'scan'],[15,20,'settle'],[20,39,'run']],failures:[{time:39,test:'panel.test.ts · restores focus on reopen',log:'✗ restores focus on reopen\nExpected: panel trigger focused\nActual: focus moved to board'}]}
+  {id:'root',name:'Workspace root',stage:'scan',result:'Passed',log:'.                                                                [100%]\n1 passed in 0.02s',events:[[4,9,'scan'],[9,15,'run'],[24,31,'run'],[31,34,'pass'],[53,60,'scan']],failures:[workspaceFailure]},
+  {id:'1e724a28',name:'Release 0.7.0',stage:'settle',result:'No run yet',log:'No check output yet.',events:[[48,53,'scan'],[53,60,'settle']],failures:[]},
+  {id:'example-a',name:'Board shortcuts',stage:'run',result:'Passed',log:'...                                                              [100%]\n3 passed in 0.03s',events:[[5,10,'scan'],[10,18,'run'],[18,21,'pass'],[37,43,'scan'],[43,50,'settle'],[50,60,'run']],failures:[]},
+  {id:'example-b',name:'Plugin panel',stage:'idle',result:'1 failure',log:panelFailure.log,events:[[10,15,'scan'],[15,20,'settle'],[20,39,'run']],failures:[panelFailure]}
 ];
 let selected = 'example-b', zoom = 1;
 const buttons = [], markers = [];
@@ -166,31 +168,11 @@ function pick(id, clickedFailure) {
   const d = data.find(d => d.id === id);
   for (const [button,key] of buttons) button.setAttribute('aria-pressed',String(key === id));
   for (const [marker,failure] of markers) marker.setAttribute('aria-pressed',String(failure === clickedFailure));
-  $('source-kind').textContent = d.real ? 'Real checkout' : 'Example worktree';
-  $('owner').textContent = id === 'root' ? 'Repository root' : `Thread ${id}`;
-  $('source-name').textContent = d.name; $('branch').textContent = d.branch;
-  $('phase').textContent = phase[d.stage]; $('phase').className = d.stage;
-  $('outcome').textContent = d.result; $('outcome').className = d.tone;
-  $('finding').textContent = d.finding;
-  const failure = clickedFailure ?? d.failures.at(-1);
-  if (failure) {
-    const {time,test} = failure;
-    const code = document.createElement('code');
-    code.textContent = `${timeLabel(time)} · ${test}`;
-    $('finding').append(code);
-  }
-  $('routing').textContent = d.tone === 'fail' ? `Example failure card linked to thread ${id}.` : 'No open failure card.';
-  const events = [
-    ...d.events.map(([from,to,s]) => [from,`${timeLabel(from)} to ${timeLabel(to)}: ${phase[s]}`]),
-    ...d.failures.map(({time,test}) => [time,`${timeLabel(time)}: Failure detected (${test})`])
-  ];
-  $('events').textContent = events.sort(([a],[b]) => a-b).map(([,label]) => label).join(' · ');
-  $('log-title').textContent = clickedFailure ? `Test log · ${timeLabel(clickedFailure.time)} · simulated` : 'Last run output · demo';
-  $('log').textContent = clickedFailure ? clickedFailure.log : d.log;
-  if (clickedFailure) {
-    $('log-details').open = true;
-    $('log-details').scrollIntoView({block:'nearest',inline:'nearest'});
-  }
+  $('log-context').textContent = `${d.name} · pytest · ${clickedFailure ? timeLabel(clickedFailure.time) : 'Latest run'}`;
+  const log = $('log');
+  log.textContent = clickedFailure ? clickedFailure.log : d.log;
+  log.scrollTo(0,0);
+  if (clickedFailure) $('detail-heading').scrollIntoView({block:'nearest',inline:'nearest'});
   drawTimeline();
 }
 function drawTimeline() {
