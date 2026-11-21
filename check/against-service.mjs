@@ -90,8 +90,8 @@ test("a failing run leaves the one card it was configured to leave, and no other
 				{
 					name: "bughound",
 					command: binary,
-					// `--watch python` is the registration switching the Python side on for the folder it is given:
-					// without it, or a tick in the panel, a folder is watched for nothing at all.
+					// `--watch python` is the registration switching the pytest preset suite on for the folder it is given:
+					// without it, or a save in the panel, a folder is watched for nothing at all.
 					args: ["--interval-ms", "250", "--debounce-ms", "100", "--settings", join(root, "bughound.json"), "--pytest", fakePytest, "--watch", "python"],
 					visual: { title: "bughound", place: "drawer", entry: "assets/panel.html", files: ["assets/panel.html", "assets/panel.js", "assets/panel.css"] },
 				},

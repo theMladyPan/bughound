@@ -98,7 +98,7 @@ button:focus-visible, .lane-scroll:focus-visible, .test-log:focus-visible {
   z-index: 10;
   top: calc(100% + 6px);
   right: 0;
-  width: min(300px, 90vw);
+  width: min(340px, 92vw);
   padding: 10px;
   background: var(--card);
   border: 1px solid var(--border-bright);
@@ -243,6 +243,31 @@ button:focus-visible, .lane-scroll:focus-visible, .test-log:focus-visible {
 }
 
 .pending { margin: 0; padding: 6px 14px; color: var(--amber); white-space: pre-wrap; }
+
+.settings-rule { margin: 10px 0 6px; border: 0; border-top: 1px solid var(--border); }
+.suite-add { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+.suite-list { display: flex; flex-direction: column; gap: 8px; }
+.suite-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.suite-card label { display: flex; flex-direction: column; gap: 2px; align-items: stretch; }
+.suite-card input, .suite-card select, .suite-card textarea {
+  background: var(--drawer);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font: inherit;
+  padding: 2px 6px;
+  max-width: 100%;
+}
+.suite-card textarea { min-height: 3em; resize: vertical; }
+.suite-card button { align-self: flex-start; }
 
 @container panel (max-width: 719px) {
   .panel-main {

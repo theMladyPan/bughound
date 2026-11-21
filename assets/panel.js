@@ -11,7 +11,7 @@
  * `state` carries worktree lanes, their last 30 minutes of activity, failure dots, and selected-check
  * logs. The panel polls it; `run` queues a run for the selected lane, `toggle_pause` pauses watching,
  * and `log` returns the lane's latest output. The board adds the workspace this tab belongs to, so
- * nothing here names a folder.
+ * nothing here names a folder. Suites are per selected worktree: `set_suites` writes them.
  */
 let nonce = "";
 let nextId = 0;
@@ -30,12 +30,16 @@ const copyBtn = document.getElementById("copy");
 const setIntervalEl = document.getElementById("setInterval");
 const setDebounceEl = document.getElementById("setDebounce");
 const setTimeoutEl = document.getElementById("setTimeout");
+const setMaxHopsEl = document.getElementById("setMaxHops");
 const setNoteEl = document.getElementById("setNote");
 const saveSettingsBtn = document.getElementById("saveSettings");
-const watchPythonEl = document.getElementById("watchPython");
-const watchJavascriptEl = document.getElementById("watchJavascript");
 const fullConfigEl = document.getElementById("fullOnConfigChange");
-const watchNoteEl = document.getElementById("watchNote");
+const suiteListEl = document.getElementById("suiteList");
+const suitesNoteEl = document.getElementById("suitesNote");
+const saveSuitesBtn = document.getElementById("saveSuites");
+const addPythonBtn = document.getElementById("addPython");
+const addNodeBtn = document.getElementById("addNode");
+const addCustomBtn = document.getElementById("addCustom");
 const panelMainEl = document.querySelector(".panel-main");
 const selectedEl = document.getElementById("selected");
 const selectedSplitterEl = document.getElementById("selectedSplitter");
@@ -46,7 +50,7 @@ const plotTracksEl = document.getElementById("plotTracks");
 const timelineArtEl = document.getElementById("timelineArt");
 const ticksEl = document.getElementById("ticks");
 
-const NOTHING_ON = "nothing is switched on for this folder";
+const NOTHING_ON = "no test suite is configured for this folder";
 const MIN_SECONDS = 60;
 const MAX_SECONDS = 1800;
 const EVENT_COLORS = {
@@ -75,7 +79,7 @@ let selectedFailure = null;
 let visibleSeconds = MIN_SECONDS;
 let lastLoadedLogId = null;
 const laneButtons = new Map();
-let watchSaving = false;
+let suitesDirty = false;
 
 function ask(method, params = {}) {
   const id = (nextId += 1);
@@ -108,11 +112,13 @@ function ageSeconds(atMs, nowMs) {
   return Math.max(0, (nowMs - atMs) / 1000);
 }
 
-function describeWatch(watch) {
-  const on = [];
-  if (watch?.python) on.push("python tests");
-  if (watch?.javascript) on.push("javascript tests");
-  return on.length ? `watching ${on.join(" and ")}` : "nothing is switched on";
+function suitesOf(row) {
+  return Array.isArray(row?.suites) ? row.suites : [];
+}
+
+function describeSuites(row) {
+  const suites = suitesOf(row);
+  return suites.length ? suites.map((suite) => suite.name).join(", ") : "nothing is configured";
 }
 
 function activityMessages(state) {
@@ -123,9 +129,8 @@ function activityMessages(state) {
   }
   for (const row of lanes) {
     const prefix = row.name || row.id;
-    const watch = row.watch || { python: false, javascript: false };
-    if (watch.python !== true && watch.javascript !== true) {
-      lines.push(`${prefix}: nothing is switched on. Select a worktree to set its switches.`);
+    if (!suitesOf(row).length) {
+      lines.push(`${prefix}: no test suite is configured. Select a worktree to set its suites.`);
     }
     for (const path of Array.isArray(row.pending) ? row.pending : []) {
       lines.push(`${prefix}: change detected in ${path}.`);
@@ -325,16 +330,16 @@ function render(state) {
     runAllBtn.disabled = true;
     runFailedBtn.hidden = true;
     pauseBtn.textContent = state.paused ? "resume" : "pause";
-    watchPythonEl.disabled = true;
-    watchJavascriptEl.disabled = true;
-    watchNoteEl.textContent = "select a worktree to set its switches";
+    renderSuiteEditor(null);
+    suitesNoteEl.textContent = "select a worktree to set its suites";
     detailHeadingEl.textContent = "Bughound messages";
     logContextEl.textContent = "all lanes";
     logEl.textContent = activityMessages(state);
-    if (state?.settings && document.activeElement !== setIntervalEl && document.activeElement !== setDebounceEl && document.activeElement !== setTimeoutEl && document.activeElement !== fullConfigEl) {
+    if (state?.settings && document.activeElement !== setIntervalEl && document.activeElement !== setDebounceEl && document.activeElement !== setTimeoutEl && document.activeElement !== setMaxHopsEl && document.activeElement !== fullConfigEl) {
       setIntervalEl.value = state.settings.intervalMs;
       setDebounceEl.value = state.settings.debounceMs;
       setTimeoutEl.value = state.settings.timeoutS;
+      setMaxHopsEl.value = state.settings.maxHops ?? 2;
       fullConfigEl.checked = state.settings.fullOnConfigChange === true;
     }
     drawTimeline();
@@ -344,18 +349,11 @@ function render(state) {
   const phase = row.phase || "idle";
   const last = row.lastRun;
   dotEl.className = "dot" + (phase === "running" || phase === "debouncing" ? " work" : last?.status === "failed" ? " bad" : last?.status === "passed" ? " ok" : "");
-  const watch = row.watch || { python: false, javascript: false };
-  if (!watchSaving) {
-    watchPythonEl.checked = watch.python === true;
-    watchJavascriptEl.checked = watch.javascript === true;
-  }
-  watchPythonEl.disabled = false;
-  watchJavascriptEl.disabled = false;
-  watchNoteEl.textContent = describeWatch(watch);
-  runAllBtn.disabled = watch.python !== true && watch.javascript !== true;
+  renderSuiteEditor(row);
+  runAllBtn.disabled = suitesOf(row).length === 0;
   const bits = [row.name || row.id];
   if (row.threadId) bits.push(row.threadId);
-  if (watch.python !== true && watch.javascript !== true) bits.push("nothing switched on");
+  if (suitesOf(row).length === 0) bits.push("nothing configured");
   if (row.lastScanAt) bits.push(`scanned ${new Date(row.lastScanAt).toLocaleTimeString()}`);
   if (last) bits.push(`${last.status} · ${last.summary} · ${new Date(last.at).toLocaleTimeString()}`);
   metaEl.textContent = bits.join(" · ");
@@ -364,10 +362,11 @@ function render(state) {
   pendingEl.hidden = pending.length === 0;
   if (pending.length) pendingEl.textContent = pending.join("\n");
 
-  if (state?.settings && document.activeElement !== setIntervalEl && document.activeElement !== setDebounceEl && document.activeElement !== setTimeoutEl && document.activeElement !== fullConfigEl) {
+  if (state?.settings && document.activeElement !== setIntervalEl && document.activeElement !== setDebounceEl && document.activeElement !== setTimeoutEl && document.activeElement !== setMaxHopsEl && document.activeElement !== fullConfigEl) {
     setIntervalEl.value = state.settings.intervalMs;
     setDebounceEl.value = state.settings.debounceMs;
     setTimeoutEl.value = state.settings.timeoutS;
+    setMaxHopsEl.value = state.settings.maxHops ?? 2;
     fullConfigEl.checked = state.settings.fullOnConfigChange === true;
   }
   pauseBtn.textContent = state.paused ? "resume" : "pause";
@@ -514,32 +513,189 @@ saveSettingsBtn.addEventListener("click", async () => {
   const interval = Number(setIntervalEl.value);
   const debounce = Number(setDebounceEl.value);
   const timeout = Number(setTimeoutEl.value);
+  const maxHops = Number(setMaxHopsEl.value);
   if (Number.isFinite(interval)) params.intervalMs = interval;
   if (Number.isFinite(debounce)) params.debounceMs = debounce;
   if (Number.isFinite(timeout)) params.timeoutS = timeout;
+  if (Number.isFinite(maxHops)) params.maxHops = maxHops;
   params.fullOnConfigChange = fullConfigEl.checked;
   try {
     const answer = await ask("set_config", params);
-    setNoteEl.textContent = answer.ok ? `saved: ${answer.settings.intervalMs}ms · ${answer.settings.debounceMs}ms · ${answer.settings.timeoutS}s · full on config: ${answer.settings.fullOnConfigChange}` : "not saved";
+    setNoteEl.textContent = answer.ok ? `saved: ${answer.settings.intervalMs}ms · ${answer.settings.debounceMs}ms · ${answer.settings.timeoutS}s · depth ${answer.settings.maxHops} · full on config: ${answer.settings.fullOnConfigChange}` : "not saved";
   } catch (err) {
     setNoteEl.textContent = err.message;
   }
 });
 
-async function saveWatch() {
-  watchSaving = true;
+function field(label, type, value) {
+  const wrap = document.createElement("label");
+  wrap.textContent = label + " ";
+  const input = document.createElement("input");
+  input.type = type;
+  input.value = value || "";
+  wrap.appendChild(input);
+  return { wrap, input };
+}
+
+function textLines(list) {
+  return Array.isArray(list) ? list.join("\n") : "";
+}
+
+function parseLines(text) {
+  return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+function linesField(label, value) {
+  const wrap = document.createElement("label");
+  wrap.textContent = label + " ";
+  const input = document.createElement("textarea");
+  input.rows = 2;
+  input.value = value || "";
+  wrap.appendChild(input);
+  return { wrap, input };
+}
+
+function renderSuiteEditor(row) {
+  if (!row) {
+    suiteListEl.replaceChildren();
+    return;
+  }
+  const editorFocused = suiteListEl.contains(document.activeElement);
+  if (suitesDirty || editorFocused) return;
+  suiteListEl.replaceChildren();
+  const suites = suitesOf(row);
+  for (const suite of suites) {
+    const card = document.createElement("div");
+    card.className = "suite-card";
+    card.dataset.preset = suite.preset || "command";
+    const nameField = field("name", "text", suite.name);
+    nameField.input.dataset.key = "name";
+    const presetSelect = document.createElement("select");
+    presetSelect.dataset.key = "preset";
+    for (const preset of ["pytest", "node", "command"]) {
+      const option = document.createElement("option");
+      option.value = preset;
+      option.textContent = preset;
+      presetSelect.appendChild(option);
+    }
+    presetSelect.value = suite.preset || "command";
+    const presetWrap = document.createElement("label");
+    presetWrap.textContent = "preset ";
+    presetWrap.appendChild(presetSelect);
+    const testGlobs = linesField("test globs", textLines(suite.testGlobs));
+    testGlobs.input.classList.add("wide");
+    testGlobs.input.dataset.key = "testGlobs";
+    const watchGlobs = linesField("watch globs (custom)", textLines(suite.watchGlobs));
+    watchGlobs.input.classList.add("wide");
+    watchGlobs.input.dataset.key = "watchGlobs";
+    const run = field("run", "text", suite.run);
+    run.input.classList.add("wide");
+    run.input.dataset.key = "run";
+    const fullRun = field("full run", "text", suite.fullRun);
+    fullRun.input.classList.add("wide");
+    fullRun.input.dataset.key = "fullRun";
+    const configFiles = linesField("config files", textLines(suite.configFiles));
+    configFiles.input.classList.add("wide");
+    configFiles.input.dataset.key = "configFiles";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "remove";
+    remove.addEventListener("click", () => {
+      card.remove();
+      suitesDirty = true;
+    });
+    card.append(nameField.wrap, presetWrap, testGlobs.wrap, watchGlobs.wrap, run.wrap, fullRun.wrap, configFiles.wrap, remove);
+    suiteListEl.appendChild(card);
+  }
+  suitesNoteEl.textContent = describeSuites(row);
+}
+
+function collectSuites() {
+  const suites = [];
+  for (const card of suiteListEl.querySelectorAll(".suite-card")) {
+    const read = (key) => card.querySelector(`[data-key="${key}"]`);
+    const preset = read("preset")?.value || "command";
+    const name = (read("name")?.value || preset).trim() || preset;
+    suites.push({
+      name,
+      preset,
+      testGlobs: parseLines(read("testGlobs")?.value || ""),
+      watchGlobs: parseLines(read("watchGlobs")?.value || ""),
+      run: (read("run")?.value || "").trim(),
+      fullRun: (read("fullRun")?.value || "").trim(),
+      configFiles: parseLines(read("configFiles")?.value || ""),
+    });
+  }
+  return suites;
+}
+
+async function saveSuites() {
+  if (!selectedId) return;
+  suitesDirty = false;
   try {
-    const answer = await ask("set_watch", { python: watchPythonEl.checked, javascript: watchJavascriptEl.checked });
-    watchNoteEl.textContent = describeWatch(answer.watch);
+    const answer = await ask("set_suites", { suites: collectSuites() });
+    suitesNoteEl.textContent = answer.suites && answer.suites.length ? `saved: ${answer.suites.map((suite) => suite.name).join(", ")}` : "nothing configured";
   } catch (err) {
-    watchNoteEl.textContent = err.message || "not saved";
-  } finally {
-    watchSaving = false;
+    suitesNoteEl.textContent = err.message || "not saved";
   }
   await poll();
 }
 
-watchPythonEl.addEventListener("change", () => void saveWatch());
-watchJavascriptEl.addEventListener("change", () => void saveWatch());
+function addSuite(name, preset, extra = {}) {
+  if (!selectedId) {
+    suitesNoteEl.textContent = "select a worktree first";
+    return;
+  }
+  renderSuiteEditor(currentState && lanesFrom(currentState).find((lane) => lane.id === selectedId));
+  const card = document.createElement("div");
+  card.className = "suite-card";
+  const nameField = field("name", "text", name);
+  nameField.input.dataset.key = "name";
+  const presetSelect = document.createElement("select");
+  presetSelect.dataset.key = "preset";
+  for (const optionPreset of ["pytest", "node", "command"]) {
+    const option = document.createElement("option");
+    option.value = optionPreset;
+    option.textContent = optionPreset;
+    presetSelect.appendChild(option);
+  }
+  presetSelect.value = preset;
+  const presetWrap = document.createElement("label");
+  presetWrap.textContent = "preset ";
+  presetWrap.appendChild(presetSelect);
+  const testGlobs = linesField("test globs", extra.testGlobs || "");
+  testGlobs.input.classList.add("wide");
+  testGlobs.input.dataset.key = "testGlobs";
+  const watchGlobs = linesField("watch globs (custom)", extra.watchGlobs || "");
+  watchGlobs.input.classList.add("wide");
+  watchGlobs.input.dataset.key = "watchGlobs";
+  const run = field("run", "text", extra.run || "");
+  run.input.classList.add("wide");
+  run.input.dataset.key = "run";
+  const fullRun = field("full run", "text", extra.fullRun || "");
+  fullRun.input.classList.add("wide");
+  fullRun.input.dataset.key = "fullRun";
+  const configFiles = linesField("config files", extra.configFiles || "");
+  configFiles.input.classList.add("wide");
+  configFiles.input.dataset.key = "configFiles";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "remove";
+  remove.addEventListener("click", () => {
+    card.remove();
+    suitesDirty = true;
+  });
+  card.append(nameField.wrap, presetWrap, testGlobs.wrap, watchGlobs.wrap, run.wrap, fullRun.wrap, configFiles.wrap, remove);
+  suiteListEl.appendChild(card);
+  suitesDirty = true;
+}
+
+suiteListEl.addEventListener("input", () => {
+  suitesDirty = true;
+});
+addPythonBtn.addEventListener("click", () => addSuite("python tests", "pytest"));
+addNodeBtn.addEventListener("click", () => addSuite("javascript tests", "node"));
+addCustomBtn.addEventListener("click", () => addSuite("custom tests", "command", { testGlobs: "**/*.test.*", run: "my command {targets}", fullRun: "my command" }));
+saveSuitesBtn.addEventListener("click", () => void saveSuites());
 
 window.addEventListener("resize", drawTimeline);

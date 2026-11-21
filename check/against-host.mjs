@@ -156,11 +156,19 @@ async function started() {
 	return { host, ...server };
 }
 
-/** The panel's own switches, one call each, exactly as a tick in the drawer makes them. */
+/** The panel's own suite editor, one call each, exactly as a save in the drawer makes them. */
 async function switchOn(host) {
-	const python = await host.request("visual.request", { workspace: WS, method: "set_watch", params: { python: true } });
+	const python = await host.request("visual.request", {
+		workspace: WS,
+		method: "set_suites",
+		params: { suites: [{ name: "python tests", preset: "pytest" }] },
+	});
 	assert.equal(python.ok, true);
-	const javascript = await host.request("visual.request", { workspace: WS_TS, method: "set_watch", params: { javascript: true } });
+	const javascript = await host.request("visual.request", {
+		workspace: WS_TS,
+		method: "set_suites",
+		params: { suites: [{ name: "javascript tests", preset: "node" }] },
+	});
 	assert.equal(javascript.ok, true);
 }
 
@@ -177,19 +185,19 @@ test("a daemon starts the plugin, and it asks for the workspaces and the settled
 	}
 });
 
-test("a workspace with nothing switched on is watched for nothing, and says so", async () => {
+test("a workspace with nothing configured is watched for nothing, and says so", async () => {
 	const { host } = await started();
 	try {
 		// The state a fresh install is in: the folder is known, and nothing is read from it.
 		const state = await host.request("visual.request", { workspace: WS, method: "state", params: {} });
 		const row = state.workspaces.find((one) => one.id === WS);
-		assert.deepEqual(row.watch, { python: false, javascript: false }, "both sides start off");
+		assert.deepEqual(row.suites, [], "no suites start configured");
 		assert.equal(row.lastScanAt, null, "an unwatched folder is never walked");
 		assert.equal(row.phase, "off");
 		// run all has nothing to run, and hands back the reason the panel shows.
 		const run = await host.request("visual.request", { workspace: WS, method: "run", params: { scope: "all" } });
 		assert.equal(run.queued, false);
-		assert.match(run.reason, /nothing is switched on/);
+		assert.match(run.reason, /no test suite is configured/);
 	} finally {
 		await host.close();
 	}

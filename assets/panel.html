@@ -26,19 +26,25 @@
         <details class="settings" id="settings">
           <summary>settings</summary>
           <div class="settings-panel">
-            <div class="watch-switches">
-              <label><input type="checkbox" id="watchPython"> python tests</label>
-              <label><input type="checkbox" id="watchJavascript"> javascript tests</label>
-              <label><input type="checkbox" id="fullOnConfigChange"> full run on config change</label>
-            </div>
-            <p class="note" id="watchNote" role="status"></p>
             <div class="timings">
               <label>interval <input type="number" id="setInterval" min="250" step="250"></label>
               <label>debounce <input type="number" id="setDebounce" min="0" step="100"></label>
               <label>timeout <input type="number" id="setTimeout" min="1" step="10"></label>
+              <label>depth cap <input type="number" id="setMaxHops" min="1" step="1"></label>
+              <label><input type="checkbox" id="fullOnConfigChange"> full run on config change</label>
             </div>
-            <button type="button" id="saveSettings">save settings</button>
+            <button type="button" id="saveSettings">save timings</button>
             <p class="note" id="setNote" role="status"></p>
+            <hr class="settings-rule">
+            <p class="note" id="suitesTitle">Suites for this worktree</p>
+            <div class="suite-add">
+              <button type="button" id="addPython">+ pytest</button>
+              <button type="button" id="addNode">+ node --test</button>
+              <button type="button" id="addCustom">+ custom command</button>
+            </div>
+            <div id="suiteList" class="suite-list"></div>
+            <button type="button" id="saveSuites">apply suites</button>
+            <p class="note" id="suitesNote" role="status">Select a worktree to set its suites.</p>
           </div>
         </details>
       </div>
