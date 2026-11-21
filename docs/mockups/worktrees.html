@@ -35,7 +35,7 @@ code {font-family:var(--mono)}
 .zoom button {min-width:28px;padding:2px 5px;background:var(--card);border:1px solid var(--border);border-radius:4px}
 .zoom button:disabled {opacity:.5;cursor:default}
 .timeline {display:grid;grid-template-columns:clamp(136px,24%,220px) minmax(0,1fr);grid-template-rows:20px repeat(4,44px) auto;--lane-height:44px;padding:9px 14px;background:var(--drawer)}
-.plot-scroll {grid-column:2;grid-row:1 / 7;overflow-x:auto;min-width:0}
+.plot-scroll {grid-column:2;grid-row:1 / 7;overflow-x:auto;min-width:0;scrollbar-width:none}.plot-scroll::-webkit-scrollbar {display:none}body:not(.mock-motion) #plot-scroll {scrollbar-color:transparent transparent}
 .plot-scroll:focus-visible {outline:2px solid var(--accent);outline-offset:-2px}
 .plot {min-width:100%;position:relative}
 .ticks {height:20px;display:flex;justify-content:space-between;color:var(--muted);font:10px var(--mono);gap:4px}
@@ -77,11 +77,10 @@ code {font-family:var(--mono)}
   <article><h2 class="fail">● Bughound: 1 failure</h2><p>Plugin panel · example thread</p></article>
 </main>
 <section class="dock" aria-labelledby="dock-title">
-  <header class="dock-bar"><h1 id="dock-title">Bughound activity timeline</h1><span>· pi-studio</span><button id="dock-toggle" type="button" aria-controls="dock-body" aria-expanded="true">Roll down</button></header>
+  <header class="dock-bar"><h1 id="dock-title">Bughound activity timeline</h1><button id="dock-toggle" type="button" aria-controls="dock-body" aria-expanded="true">Roll down</button></header>
   <div class="dock-body" id="dock-body">
-    <section aria-label="Last 60 simulated seconds">
-      <div class="summary" aria-label="Current demo activity">
-        <span class="pill scan"><i class="mark"></i>1 scanning</span><span class="pill settle"><i class="mark"></i>1 settling</span><span class="pill run"><i class="mark"></i>1 running</span><span class="pill fail"><i class="mark"></i>1 failing</span>
+    <section aria-label="Last 60 simulated seconds" class="mock-motion">
+      <div class="summary">
         <div class="zoom" role="group" aria-label="Timeline zoom"><button id="zoom-out" type="button" aria-label="Zoom out" disabled>−</button><output id="zoom-level" aria-label="Zoom level">1×</output><button id="zoom-in" type="button" aria-label="Zoom in">+</button></div>
       </div>
       <div id="timeline" class="timeline">
@@ -91,9 +90,8 @@ code {font-family:var(--mono)}
             <div class="plot-tracks" id="plot-tracks"><canvas id="timeline-art" aria-hidden="true"></canvas></div>
           </div>
         </div>
-        <div class="timeline-legend"<span class="scan"><i></i>Scan</span><span class="settle"><i></i>Settle</span><span class="run"><i></i>Run</span><span class="pass"><i></i>Pass</span><span class="fail"><i class="mark"></i>Failure detected</span></div>
+        <div class="timeline-legend" title="Scan (blue) · Settle (yellow) · Run (violet) · Pass (green)"><span class="fail"><i class="mark"></i>Failure detected</span></div>
       </div>
-      <p class="caption">Zoom in to scroll through time. Select a red dot to see that test’s log. Activity is simulated.</p>
       <noscript><p class="caption">Enable JavaScript to view the timeline.</p></noscript>
     </section>
     <section class="detail" aria-labelledby="detail-heading">
@@ -137,7 +135,7 @@ const data = [
   {id:'example-a',name:'Board shortcuts',stage:'run',result:'Passed',log:'...                                                              [100%]\n3 passed in 0.03s',events:[[5,10,'scan'],[10,18,'run'],[18,21,'pass'],[37,43,'scan'],[43,50,'settle'],[50,60,'run']],failures:[]},
   {id:'example-b',name:'Plugin panel',stage:'idle',result:'1 failure',log:panelFailure.log,events:[[10,15,'scan'],[15,20,'settle'],[20,39,'run']],failures:[panelFailure]}
 ];
-let selected = 'example-b', zoom = 1;
+let selected = 'example-b', zoom = 1, zoomTimer;
 const buttons = [], markers = [];
 for (const [i,d] of data.entries()) {
   const button = document.createElement('button');
@@ -201,17 +199,25 @@ function drawTimeline() {
 
   }
 }
-function changeZoom(next) {
+function changeZoom(next, pinRight=true) {
   const scroll = $('plot-scroll');
-  const center = (scroll.scrollLeft + scroll.clientWidth/2)/scroll.scrollWidth;
   zoom = next;
   $('plot').style.width = `${zoom*100}%`;
-  scroll.scrollLeft = center*scroll.scrollWidth - scroll.clientWidth/2;
+  scroll.scrollTo({left:pinRight ? 999999 : 0,behavior:'instant'});
   $('zoom-level').textContent = `${zoom}×`;
   $('zoom-out').disabled = zoom === 1;
   $('zoom-in').disabled = zoom === 4;
   drawTimeline();
 }
+$('plot-scroll').addEventListener('wheel',event => {
+  event.preventDefault();
+  const zoomingIn = event.deltaY > 0;
+  const next = Math.min(4,Math.max(1,zoom*(zoomingIn ? 2 : .5)));
+  if (next === zoom) return;
+  changeZoom(next,zoomingIn);
+  clearTimeout(zoomTimer);
+  zoomTimer = setTimeout(drawTimeline,100);
+},{passive:false});
 $('zoom-in').addEventListener('click',() => changeZoom(zoom*2));
 $('zoom-out').addEventListener('click',() => changeZoom(zoom/2));
 $('dock-toggle').addEventListener('click',() => {
