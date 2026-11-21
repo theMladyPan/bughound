@@ -1,0 +1,20 @@
+{
+  "intervalMs": 2000,
+  "debounceMs": 500,
+  "timeoutS": 60,
+  "fullOnConfigChange": true,
+  "maxHops": 2,
+  "suites": {
+    "my-workspace": [
+      {
+        "name": "python tests",
+        "preset": "pytest",
+        "testGlobs": [],
+        "watchGlobs": [],
+        "run": "",
+        "fullRun": "",
+        "configFiles": []
+      }
+    ]
+  }
+}
