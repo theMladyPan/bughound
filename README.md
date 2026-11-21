@@ -123,8 +123,9 @@ The args, all optional:
   a folder no panel was opened on. Without it, and until a suite is added in the panel, a folder is
   watched for nothing.
 
-The panel's settings carry, per worktree, a list of test suites, editable by hand in the same
-`bughound.json` if you prefer JSON. A suite is one of two presets or a custom command:
+The panel's settings carry, per repository, a list of test suites, editable by hand in the same
+`bughound.json` if you prefer JSON. Every worktree folder of one repo shares one entry, since each
+worktree is a checkout of the same code. A suite is one of two presets or a custom command:
 
 - `preset: "pytest"` maps changed files through the Python import graph and runs the resolved files
   with the pytest binary and its flags. `preset: "node"` does the same over `import`, `export` and

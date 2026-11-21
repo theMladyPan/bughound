@@ -23,9 +23,9 @@
 //! `--watch` (repeatable; `python` or `javascript`, the preset suite to switch on for the folders
 //! this plugin watches).
 //!
-//! What a folder is watched for is the panel's suite editor, one list of suites per folder, empty to
-//! begin with: a folder with no suite configured is never walked, spawns nothing, and posts no card.
-//! The type check rides with the node preset suite. Suites are also editable by hand in the settings
+//! What a folder is watched for is the panel's suite editor, one list of suites per repository,
+//! empty to begin with: a folder with no suite configured is never walked, spawns nothing, and posts
+//! no card. Every worktree of one repo shares the one list. The type check rides with the node preset suite. Suites are also editable by hand in the settings
 //! file (`bughound.json` beside the board); see README.md and `examples/` for the shape.
 //!
 //! The methods a daemon answers are documented at the top of `server/plugins/service.ts`.
@@ -623,22 +623,39 @@ impl<T: Transport> Bughound<T> {
                     "this plugin does not know that workspace",
                 ));
             }
+            // Suites live under the repository key, so every worktree folder of one repo shares one
+            // entry. An entry still keyed by the workspace's own folder id is the old shape: it is
+            // read as a fallback until this save moves it under the repository key for good.
+            let repo_key = shared
+                .workspaces
+                .values()
+                .find(|tracker| tracker.workspace_id == workspace_id)
+                .map(|tracker| tracker.repo_key.clone())
+                .unwrap_or_else(|| workspace_id.clone());
             if suites.is_empty() {
                 // Keep the key: an empty list is what the panel set, and `--watch` defaults only
                 // seed folders nobody has spoken for.
-                shared.config.suites.insert(workspace_id.clone(), Vec::new());
+                shared.config.suites.insert(repo_key.clone(), Vec::new());
             } else {
-                shared.config.suites.insert(workspace_id.clone(), suites.clone());
+                shared
+                    .config
+                    .suites
+                    .insert(repo_key.clone(), suites.clone());
+            }
+            if repo_key != workspace_id {
+                shared.config.suites.remove(&workspace_id);
             }
             let saved = Settings::from_config(&shared.config);
             if let Err(error) = saved.write(&self.settings_path) {
                 eprintln!("bughound: the settings could not be written: {error}");
                 return Err(RpcError::new(-32603, "the settings could not be written"));
             }
+            // Every lane of the repo resets, whichever worktree the save came from: they may live
+            // under different workspace rows, and all of them just learned about the same suites.
             for tracker in shared
                 .workspaces
                 .values_mut()
-                .filter(|tracker| tracker.workspace_id == workspace_id)
+                .filter(|tracker| tracker.repo_key == repo_key)
             {
                 // The next scan is a baseline again: a suite just added has files no scan saw.
                 tracker.initialized = false;
@@ -879,7 +896,7 @@ fn insert_workspace_trackers(
         shared
             .config
             .suites
-            .entry(workspace_id.to_string())
+            .entry(repo_key(&worktrees[0].folder))
             .or_insert(defaults);
     }
     for info in worktrees {
@@ -1018,19 +1035,70 @@ fn knows(shared: &Arc<(Mutex<Shared>, Condvar)>, workspace: &str) -> bool {
             .any(|tracker| tracker.workspace_id == workspace)
 }
 
-/// What suites a folder is watched for, as the panel set them. A folder the panel has not spoken for
-/// is watched for nothing. `--watch` defaults only seed folders nobody has spoken for: deleting
-/// every suite in the panel leaves an empty list on purpose, and the defaults do not come back.
+/// What suites a folder is watched for, as the panel set them. Suites are keyed by the *repository*,
+/// so every worktree folder of one repo shares one entry: each worktree is a checkout of the same
+/// code, and a setting that had to be repeated per checkout would be a setting wrong for every
+/// new branch. Entries written before this were keyed by the workspace's folder and still read as a
+/// fallback; the next save rewrites them under the repository key.
 fn suites_of(shared: &Shared, workspace: &str) -> Vec<Suite> {
     let workspace_id = shared
         .workspaces
         .get(workspace)
         .map(|tracker| tracker.workspace_id.as_str())
         .unwrap_or_else(|| workspace.split(':').next().unwrap_or(workspace));
+    // The workspace's lanes share suites keyed by their shared repository. An entry keyed by the
+    // workspace's own folder id is what an older settings file holds: it applies until the next save
+    // moves it under the repository key.
+    let repo_key = shared
+        .workspaces
+        .get(workspace)
+        .map(|tracker| tracker.repo_key.clone());
+    if let Some(suites) = repo_key
+        .as_ref()
+        .and_then(|key| shared.config.suites.get(key))
+    {
+        return suites.clone();
+    }
     match shared.config.suites.get(workspace_id) {
         Some(suites) => suites.clone(),
         None => shared.config.watch_defaults.clone(),
     }
+}
+
+/// The identity a suite list is saved against: a folder's repository, so any checkout of the same
+/// repo shares the list. That is the git common dir (the main worktree's `.git`, the same from any
+/// worktree of the repo), resolved against the folder when git answers with a relative path. A
+/// folder git does not govern is its own identity, which is the whole point of falling back.
+fn repo_key(folder: &Path) -> String {
+    let canonical = folder.canonicalize().unwrap_or_else(|_| folder.to_path_buf());
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(folder)
+        .arg("rev-parse")
+        .arg("--git-common-dir")
+        .output();
+    let Ok(output) = output else {
+        return canonical.to_string_lossy().into_owned();
+    };
+    if !output.status.success() {
+        return canonical.to_string_lossy().into_owned();
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let common = raw.lines().next().unwrap_or("").trim();
+    if common.is_empty() {
+        return canonical.to_string_lossy().into_owned();
+    }
+    let path = PathBuf::from(common);
+    let joined = if path.is_absolute() {
+        path
+    } else {
+        canonical.join(path)
+    };
+    joined
+        .canonicalize()
+        .unwrap_or(joined)
+        .to_string_lossy()
+        .into_owned()
 }
 
 // ---------- configuration ----------
@@ -1647,6 +1715,9 @@ struct RunningView {
 struct WorkspaceTracker {
     id: String,
     workspace_id: String,
+    /// The repository identity suites are saved under: every worktree folder of one repo resolves the
+    /// same key, so suites configured for a workspace cover its worktrees and vice versa.
+    repo_key: String,
     card_key: String,
     thread_id: String,
     branch: String,
@@ -1687,6 +1758,7 @@ impl WorkspaceTracker {
         Self {
             id: id.to_string(),
             workspace_id: workspace_id.to_string(),
+            repo_key: repo_key(&folder),
             card_key,
             thread_id,
             branch,
@@ -4676,7 +4748,10 @@ mod tests {
         assert_eq!(answer(6).unwrap()["result"]["queued"], json!(true));
         assert_eq!(answer(7).unwrap()["error"]["code"], json!(METHOD_NOT_FOUND));
         let written = std::fs::read_to_string(&settings_path).unwrap();
-        assert!(written.contains("\"ws\""), "the suite survives the process, in the settings file: {written}");
+        assert!(
+            written.contains(&folder),
+            "the suite is saved against the repository folder, so every worktree of it reads it: {written}"
+        );
         assert!(written.contains("\"pytest\""), "and it is the pytest suite that was set: {written}");
     }
 
@@ -4792,6 +4867,108 @@ mod tests {
         assert_eq!(
             read.suites.get("two").map(Vec::as_slice),
             Some(vec![Suite::new("javascript tests", "node")].as_slice())
+        );
+    }
+
+    #[test]
+    fn all_worktrees_of_one_repo_share_one_suites_entry() {
+        // One small repo: the root folder and one git worktree of it. Two workspace rows, one
+        // repository: suites saved from the root are the suites the worktree reads back.
+        let project = Scratch::new("repoid");
+        project.write("pkg/calc.py", "X = 1\n");
+        let status = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&project.0)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the fixture starts a git repository");
+        Command::new("git")
+            .args(["config", "user.email", "test@example.invalid"])
+            .current_dir(&project.0)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&project.0)
+            .status()
+            .unwrap();
+        let status = Command::new("git")
+            .args(["add", "."])
+            .current_dir(&project.0)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .args(["commit", "-qm", "fixture"])
+            .current_dir(&project.0)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the fixture commits once so HEAD exists");
+        let worktree = project.0.join("child");
+        let status = Command::new("git")
+            .args(["worktree", "add", "-q", worktree.to_str().unwrap(), "HEAD"])
+            .current_dir(&project.0)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the fixture adds one git worktree");
+        // Both folders of one repository resolve the same repository key.
+        assert_eq!(repo_key(&project.0), repo_key(&worktree));
+        let mut config = Config::with_defaults();
+        config
+            .suites
+            .insert(repo_key(&project.0), vec![Suite::new("python tests", "pytest")]);
+        let mut shared = Shared::new(config);
+        for (workspace_id, folder) in [("ws-root", project.0.clone()), ("ws-child", worktree.clone())] {
+            let mut tracker = WorkspaceTracker::new(
+                workspace_id,
+                workspace_id,
+                workspace_id.to_string(),
+                folder,
+                true,
+                workspace_id.to_string(),
+                String::new(),
+                true,
+                format!("bughound:{workspace_id}"),
+            );
+            tracker.repo_key = repo_key(&tracker.folder);
+            shared.workspaces.insert(workspace_id.to_string(), tracker);
+        }
+        assert_eq!(
+            suites_of(&shared, "ws-root"),
+            vec![Suite::new("python tests", "pytest")]
+        );
+        assert_eq!(
+            suites_of(&shared, "ws-child"),
+            vec![Suite::new("python tests", "pytest")],
+            "the second workspace row is a worktree of the same repo, not a separate setting"
+        );
+    }
+
+    #[test]
+    fn an_entry_keyed_by_the_old_folder_id_still_applies() {
+        // A settings file written before suites were keyed by the repository still reads: the
+        // entry under the workspace's own folder id is the fallback until the next save.
+        let mut config = Config::with_defaults();
+        config
+            .suites
+            .insert("ws".to_string(), vec![Suite::new("python tests", "pytest")]);
+        let mut shared = Shared::new(config);
+        let mut tracker = WorkspaceTracker::new(
+            "ws",
+            "ws",
+            "ws".to_string(),
+            PathBuf::from("/nonexistent/folder"),
+            true,
+            "ws".to_string(),
+            String::new(),
+            true,
+            "bughound:ws".to_string(),
+        );
+        tracker.repo_key = "returned-by-git".to_string();
+        shared.workspaces.insert("ws".to_string(), tracker);
+        assert_eq!(
+            suites_of(&shared, "ws"),
+            vec![Suite::new("python tests", "pytest")]
         );
     }
 
