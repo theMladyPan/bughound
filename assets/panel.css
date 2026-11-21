@@ -114,9 +114,11 @@ button:focus-visible, .lane-scroll:focus-visible, .test-log:focus-visible {
   min-height: 0;
   background: var(--drawer);
 }
-.panel-main.no-selected { grid-template-columns: minmax(0, 1fr); }
+.panel-main.no-selected,
+.panel-main:has(.selected[hidden]) { grid-template-columns: minmax(0, 1fr); }
 
 .timeline-region { display: flex; flex-direction: column; grid-column: 1; min-width: 0; min-height: 0; padding: 9px 14px; }
+.vertical-splitter[hidden] { display: none; }
 .vertical-splitter {
   grid-row: 1 / -1;
   background: transparent;
@@ -201,7 +203,9 @@ button:focus-visible, .lane-scroll:focus-visible, .test-log:focus-visible {
 .failure-dot[aria-pressed="true"]::before { outline: 1px solid var(--red); outline-offset: 2px; }
 
 .selected-splitter { grid-column: 2; }
+.selected-splitter[hidden] { display: none; }
 .selected { grid-column: 3; min-width: 0; display: flex; flex-direction: column; overflow: hidden; border-left: 0; }
+.selected[hidden] { display: none; }
 .card-head {
   display: flex;
   align-items: center;
